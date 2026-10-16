@@ -7,7 +7,14 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 
-from kvcr.hint_parser import _LOGGED_HINT_ISSUES, _KVFetchHint
+from kvcr.hint_parser import (
+    _ACTION_PARSERS,
+    _LOGGED_HINT_ISSUES,
+    _KVFetchAction,
+    _KVFetchHint,
+    parse_hint_actions,
+)
+from kvcr.types import CacheTier
 
 
 @pytest.mark.parametrize("as_mapping", [False, True])
@@ -95,3 +102,77 @@ def test_kv_fetch_hint_rejects_invalid_payload(fetch_payload: object) -> None:
 
     with pytest.raises(ValueError):
         _KVFetchHint.from_hint(kv_hint)
+
+
+def _fetch_action(action_id, source, hashes, **extra):
+    payload = {"source_control_endpoint": source, "block_hashes": list(hashes), **extra}
+    return _HintAction(action_id, "kv.fetch", "1.0", payload)
+
+
+def test_parse_hint_actions_returns_every_valid_fetch_action():
+    hint = _HintEnvelope(
+        "0.1",
+        "m",
+        [
+            _fetch_action("a", "tcp://a:1", (1, 2)),
+            _HintAction("x", "kv.future_action", "1.0", {}),
+            _fetch_action("bad", "", (3,)),
+            _fetch_action("b", "tcp://b:1", (4,), destination={"medium": "cpu"}),
+        ],
+    )
+    assert parse_hint_actions(hint) == [
+        _KVFetchAction("a", "tcp://a:1", frozenset({1, 2}), CacheTier.FW_G1),
+        _KVFetchAction("b", "tcp://b:1", frozenset({4}), CacheTier.LOCAL_G2),
+    ]
+
+
+@pytest.mark.parametrize(
+    "destination, expected",
+    [
+        (None, CacheTier.FW_G1),
+        ({"medium": "GPU"}, CacheTier.FW_G1),
+        ({"medium": "Cpu", "locality": "local"}, CacheTier.LOCAL_G2),
+    ],
+)
+def test_parse_destination_media(destination, expected):
+    extra = {} if destination is None else {"destination": destination}
+    hint = _HintEnvelope("0.1", "m", [_fetch_action("a", "tcp://a:1", (1,), **extra)])
+    assert parse_hint_actions(hint)[0].destination is expected
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        {"medium": "STORAGE"},
+        {"medium": "TAPE"},
+        {"medium": "CPU", "locality": "REMOTE"},
+        "CPU",
+        {},
+    ],
+)
+def test_parse_destination_rejects_action_only(destination):
+    hint = _HintEnvelope(
+        "0.1",
+        "m",
+        [
+            _fetch_action("bad", "tcp://a:1", (1,), destination=destination),
+            _fetch_action("ok", "tcp://a:1", (2,)),
+        ],
+    )
+    assert [a.action_id for a in parse_hint_actions(hint)] == ["ok"]
+
+
+def test_parse_hint_actions_raises_when_nothing_valid():
+    hint = _HintEnvelope("0.1", "m", [_fetch_action("bad", "", (1,))])
+    with pytest.raises(ValueError):
+        parse_hint_actions(hint)
+
+
+def test_registered_action_type_is_parsed(monkeypatch):
+    class _Stub(msgspec.Struct, frozen=True):
+        action_id: str | None
+        ACTION_TYPE = "kv.test"
+
+    monkeypatch.setitem(_ACTION_PARSERS, "kv.test", ("1.0", lambda i, p: _Stub(i)))
+    hint = _HintEnvelope("0.1", "m", [_HintAction("s", "kv.test", "1.0", {})])
+    assert parse_hint_actions(hint) == [_Stub("s")]
