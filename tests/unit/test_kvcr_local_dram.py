@@ -333,6 +333,62 @@ def test_layout_matching_with_and_without_index(requested, allow_subset, expecte
         )
 
 
+def test_reserve_fill_allow_evict_false_keeps_ready_blocks(monkeypatch) -> None:
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 3)
+    local = ctypes.create_string_buffer(block_size * 2)
+    primary.raw = b"a" * block_size + b"b" * block_size + b"c" * block_size
+    agent = FakeNixlAgent()
+    policy = _RecordingFIFOPolicy()
+    kvcr = _new_local_kvcr(
+        agent,
+        local,
+        2,
+        policy=policy,
+        framework_regions=[_buffer_region(primary, len(local) // 2)],
+    )
+    resident = tuple(BlockKey(f"r{index}".encode()) for index in range(2))
+    new = BlockKey(b"new")
+    kvcr.deposit({key: [_mem_descriptor(index)] for index, key in enumerate(resident)})
+    _wait_until(lambda: len(agent.transfers) == 1)
+    agent.state = "DONE"
+    _poll_until(kvcr, lambda results: len(results) == 1)
+    decided_before = len(policy.decided)
+
+    with kvcr._core._state_lock:
+        kvcr._core._block_record(new)
+        result = kvcr._core._local_dram.reserve_fill(
+            (new,),
+            sources={new: CacheTier.REMOTE_G2},
+            required_local=False,
+            deadline=kvcr._core._operation_deadline(),
+            layout=[""],
+            allow_evict=False,
+        )
+    assert result == ({}, set())
+    assert len(policy.decided) == decided_before
+    assert all(
+        kvcr._core._block_record_map[key].local_dram.state is _LocalDramState.READY
+        for key in resident
+    )
+
+    with kvcr._core._state_lock:
+        destinations, pending = kvcr._core._local_dram.reserve_fill(
+            (new,),
+            sources={new: CacheTier.REMOTE_G2},
+            required_local=False,
+            deadline=kvcr._core._operation_deadline(),
+            layout=[""],
+            allow_evict=True,
+        )
+        assert set(destinations) == {new}
+        assert pending == set()
+        assert len(policy.decided) > decided_before
+        assert sum(key in kvcr._core._block_record_map for key in resident) == 1
+        kvcr._core._complete_local_dram_fill((new,), success=False)
+    kvcr.close()
+
+
 def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
     source = ctypes.create_string_buffer(16)

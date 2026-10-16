@@ -863,6 +863,7 @@ class _LocalDram:
         deadline: float,
         framework_hints: object | None = None,
         layout: list[str],
+        allow_evict: bool = True,
     ) -> tuple[dict[BlockKey, list[_TransferRef]], set[BlockKey]]:
         keys = tuple(dict.fromkeys(keys))
         protected = frozenset(keys)
@@ -885,7 +886,7 @@ class _LocalDram:
             if decision[0] is PlacementAction.DROP:
                 continue
             locations, evicted_keys, waiting = self._allocate_slots(
-                layout, protected, deadline
+                layout, protected, deadline, allow_evict=allow_evict
             )
             evicted.extend(evicted_keys)
             if locations is None:
@@ -1202,7 +1203,12 @@ class _LocalDram:
                 self._make_evictable(key)
 
     def _allocate_slots(
-        self, layout: list[str], protected: frozenset[BlockKey], deadline: float
+        self,
+        layout: list[str],
+        protected: frozenset[BlockKey],
+        deadline: float,
+        *,
+        allow_evict: bool = True,
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
         required = Counter(label.partition(":")[0] for label in layout)
         if all(
@@ -1216,6 +1222,8 @@ class _LocalDram:
                 [],
                 False,
             )
+        if not allow_evict:
+            return None, [], False
         if self._capacity_eviction_key is not None:
             return None, [], True
         self._retry_unscored()
