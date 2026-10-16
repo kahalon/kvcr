@@ -22,6 +22,8 @@ from _kvcr_test_utils import (
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
+    _HintAction,
+    _HintEnvelope,
     _key_history,
     _mem_descriptor,
     _new_kvcr,
@@ -1388,3 +1390,51 @@ def test_prefetch_pull_with_no_blocks_is_not_submitted():
     assert not kvcr._core._remote_fw_dram.prefetch(
         "tcp://source:1", {}, kvcr._core._clock() + 5, op_handle=-1
     )
+
+
+class _PrefetchHashAdapter:
+    def decode(self, key):
+        return int.from_bytes(key[:8], "big")
+
+    def keys_for_block_hash(self, block_hash):
+        return [BlockKey(block_hash.to_bytes(8, "big"))]
+
+
+def test_prefetch_uses_configured_repeated_pool_layout():
+    local = ctypes.create_string_buffer(16 * 2)
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
+        key_adapter=_PrefetchHashAdapter(),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        remote_options=RemoteFWDramOptions(
+            eager_ctrl_connect=False,
+            prefetch_layout=("", ""),
+            prefetch_reserve_limit_percent=100,
+        ),
+    )
+    payload = {
+        "source_control_endpoint": "tcp://source:1",
+        "block_hashes": [7],
+        "destination": {"medium": "CPU"},
+    }
+    kvcr.submit_hint(
+        _HintEnvelope("0.1", "m", [_HintAction("a", "kv.fetch", "1.0", payload)])
+    )
+    list(kvcr.poll_completed())
+    _wait_until(lambda: bool(control.sent))
+    decoded = _decode_control_message(control.sent[0][1])
+    key = BlockKey((7).to_bytes(8, "big"))
+    assert decoded["keys"] == [key]
+    assert len(decoded["dst_descriptors"]) == 1
+    assert len(decoded["dst_descriptors"][0]) == 2
+    residency = kvcr._core._block_record_map[key].local_dram
+    assert residency.layout == ["", ""]
+    assert len(residency.slots) == 2
+    agent.notifs["source"] = [_write_done_notification(decoded["op_handle"])]
+    _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
+    assert kvcr.query((key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]

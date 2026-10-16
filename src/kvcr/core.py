@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from math import ceil
@@ -23,7 +23,15 @@ from .config import (
     TelemetryStats,
     _validate_pool_layouts,
 )
-from .hint_parser import _KVFetchHint
+from .hint_actions import (  # noqa: F401 - re-exported by kvcr.api
+    HINT_ACTIONS_METRIC,
+    PREFETCH_BLOCKS_METRIC,
+    PREFETCH_QUEUED_METRIC,
+    PREFETCH_RESERVED_METRIC,
+    _ActionHandler,
+    _FetchActionHandler,
+)
+from .hint_parser import _HintAction, parse_hint_actions
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
@@ -326,6 +334,10 @@ class _KVCRCore:
             self._validate_block_layout(
                 self._prefetch_layout, "prefetch_layout must use configured pools"
             )
+        self._fetch_action_handler = _FetchActionHandler(self)
+        self._action_handlers: dict[str, _ActionHandler] = {
+            "kv.fetch": self._fetch_action_handler
+        }
         kvcr_regions = (
             {region.label: region for region in self._local_dram.memory_regions}
             if self._local_dram is not None
@@ -432,10 +444,21 @@ class _KVCRCore:
         hints: Mapping[str, object] | msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
-        hint = _KVFetchHint.from_hint(hints)
-        self._remote_fw_dram.submit_hint(
-            hint.source_endpoint, hint.block_hashes, request_id
-        )
+        self.submit_actions(parse_hint_actions(hints), request_id)
+
+    def submit_actions(
+        self,
+        actions: Sequence[_HintAction],
+        request_id: str | None = None,
+    ) -> None:
+        """Dispatch parsed actions to their handlers; takes no state lock."""
+        grouped: dict[str, list[_HintAction]] = {}
+        for action in actions:
+            grouped.setdefault(type(action).ACTION_TYPE, []).append(action)
+        for action_type, group in grouped.items():
+            handler = self._action_handlers.get(action_type)
+            if handler is not None:
+                handler.submit(group, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_fw_dram.discard_hint(request_id)
@@ -669,6 +692,7 @@ class _KVCRCore:
         self._pending_progress_items = []
         with self._state_lock:
             if not self._closed:
+                self._admit_deferred_actions()
                 if self._g3 is not None:
                     progress_items = self._g3.poll_main(progress_items)
                 if self._local_dram is not None:
@@ -677,6 +701,15 @@ class _KVCRCore:
         completed = self._completion_queue
         self._completion_queue = []
         return completed
+
+    def _admit_deferred_actions(self) -> None:
+        """Admit queued hint work within one poll's key budget."""
+        budget = self._remote_fw_dram._options.prefetch_admit_blocks_per_poll
+        now = self._clock()
+        for handler in self._action_handlers.values():
+            budget -= handler.admit(budget, now)
+            if budget <= 0:
+                break
 
     def _notify_transfer_errors(self, progress_items: list[object]) -> None:
         # Notify before cleanup can return a buffer to its allocator. Retain the
@@ -777,6 +810,8 @@ class _KVCRCore:
                         exc_info=True,
                     )
 
+        for handler in self._action_handlers.values():
+            run(handler.close)
         if self._g3 is not None:
             run(self._g3.close_main)
         if self._local_dram is not None:
@@ -1069,6 +1104,7 @@ class _KVCRCore:
     ) -> None:
         if self._local_dram is None:
             raise RuntimeError("remote fetch completed without local DRAM")
+        self._fetch_action_handler.on_fill_settled(keys)
         self._local_dram.complete_fill(keys, success=success)
 
     def _discard_local_dram_fill(self, keys: Collection[BlockKey]) -> None:

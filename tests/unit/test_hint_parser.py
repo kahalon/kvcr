@@ -11,30 +11,29 @@ from kvcr.hint_parser import (
     _ACTION_PARSERS,
     _LOGGED_HINT_ISSUES,
     _KVFetchAction,
-    _KVFetchHint,
     parse_hint_actions,
 )
 from kvcr.types import CacheTier
 
 
 @pytest.mark.parametrize("as_mapping", [False, True])
-def test_kv_fetch_hint_parses_first_fetch_action(as_mapping) -> None:
+def test_parse_hint_actions_copies_payload_fields(as_mapping) -> None:
     hint = _router_hint("tcp://source:1234", (123, 456, 123))
     hint.actions.insert(0, _HintAction("ignored", "kv.future_action", "9.0", {}))
     hint.actions.extend(_router_hint("tcp://other:1234", (789,)).actions)
 
     hint = msgspec.to_builtins(hint) if as_mapping else hint
     payload = hint["actions"][1]["payload"] if as_mapping else hint.actions[1].payload
-    parsed = _KVFetchHint.from_hint(hint)
+    parsed = parse_hint_actions(hint)
     payload["source_control_endpoint"] = "tcp://changed:1"
     payload["block_hashes"].clear()
-    assert parsed == _KVFetchHint(
-        source_endpoint="tcp://source:1234",
-        block_hashes=frozenset({123, 456}),
-    )
+    assert [(a.source_endpoint, a.block_hashes) for a in parsed] == [
+        ("tcp://source:1234", (123, 456)),
+        ("tcp://other:1234", (789,)),
+    ]
 
 
-def test_kv_fetch_hint_warns_once_per_mismatched_version_field(
+def test_parse_hint_actions_warns_once_per_mismatched_version_field(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     _LOGGED_HINT_ISSUES.clear()
@@ -48,9 +47,13 @@ def test_kv_fetch_hint_warns_once_per_mismatched_version_field(
                     msgspec.structs.replace(kv_hint.actions[0], action_version=version)
                 ],
             )
-            parsed = _KVFetchHint.from_hint(changed)
+            parsed = parse_hint_actions(changed)
 
-    assert parsed == _KVFetchHint("tcp://source:1234", frozenset({123}))
+    assert parsed == [
+        _KVFetchAction(
+            kv_hint.actions[0].action_id, "tcp://source:1234", (123,), CacheTier.FW_G1
+        )
+    ]
     assert caplog.text.count("KV hint protocol_version mismatch") == 1
     assert caplog.text.count("kv.fetch action_version mismatch") == 1
 
@@ -67,9 +70,9 @@ def test_kv_fetch_hint_warns_once_per_mismatched_version_field(
         _HintEnvelope("0.1", "test", [_HintAction("a", "kv.future_action", "1.0", {})]),
     ],
 )
-def test_kv_fetch_hint_rejects_invalid_envelope(kv_hint: object) -> None:
+def test_parse_hint_actions_rejects_invalid_envelope(kv_hint: object) -> None:
     with pytest.raises(ValueError, match="invalid router hint"):
-        _KVFetchHint.from_hint(kv_hint)  # type: ignore[arg-type]
+        parse_hint_actions(kv_hint)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -93,15 +96,15 @@ def test_kv_fetch_hint_rejects_invalid_envelope(kv_hint: object) -> None:
         },
     ],
 )
-def test_kv_fetch_hint_rejects_invalid_payload(fetch_payload: object) -> None:
-    """Reject malformed payloads on a matching ``kv.fetch`` action."""
+def test_parse_hint_actions_rejects_invalid_payload(fetch_payload: object) -> None:
+    """A single-action envelope whose ``kv.fetch`` payload is malformed is rejected."""
     kv_hint = _router_hint("tcp://source:1")
     kv_hint.actions[0] = msgspec.structs.replace(
         kv_hint.actions[0], payload=fetch_payload
     )
 
     with pytest.raises(ValueError):
-        _KVFetchHint.from_hint(kv_hint)
+        parse_hint_actions(kv_hint)
 
 
 def _fetch_action(action_id, source, hashes, **extra):
@@ -121,8 +124,8 @@ def test_parse_hint_actions_returns_every_valid_fetch_action():
         ],
     )
     assert parse_hint_actions(hint) == [
-        _KVFetchAction("a", "tcp://a:1", frozenset({1, 2}), CacheTier.FW_G1),
-        _KVFetchAction("b", "tcp://b:1", frozenset({4}), CacheTier.LOCAL_G2),
+        _KVFetchAction("a", "tcp://a:1", (1, 2), CacheTier.FW_G1),
+        _KVFetchAction("b", "tcp://b:1", (4,), CacheTier.LOCAL_G2),
     ]
 
 
@@ -132,12 +135,20 @@ def test_parse_hint_actions_returns_every_valid_fetch_action():
         (None, CacheTier.FW_G1),
         ({"medium": "GPU"}, CacheTier.FW_G1),
         ({"medium": "Cpu", "locality": "local"}, CacheTier.LOCAL_G2),
+        ({"medium": "CPU", "locality": None}, CacheTier.LOCAL_G2),
     ],
 )
 def test_parse_destination_media(destination, expected):
     extra = {} if destination is None else {"destination": destination}
     hint = _HintEnvelope("0.1", "m", [_fetch_action("a", "tcp://a:1", (1,), **extra)])
     assert parse_hint_actions(hint)[0].destination is expected
+
+
+def test_null_destination_means_engine():
+    hint = _HintEnvelope(
+        "0.1", "m", [_fetch_action("a", "tcp://a:1", (1,), destination=None)]
+    )
+    assert parse_hint_actions(hint)[0].destination is CacheTier.FW_G1
 
 
 @pytest.mark.parametrize(

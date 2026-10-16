@@ -21,6 +21,10 @@ from .config import (
 )
 from .core import (  # noqa: F401 - public re-exports
     DURATION_METRIC,
+    HINT_ACTIONS_METRIC,
+    PREFETCH_BLOCKS_METRIC,
+    PREFETCH_QUEUED_METRIC,
+    PREFETCH_RESERVED_METRIC,
     STATE_METRIC,
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,

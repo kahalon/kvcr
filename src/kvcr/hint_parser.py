@@ -59,7 +59,8 @@ class _KVFetchAction(msgspec.Struct, frozen=True):
 
     action_id: str | None
     source_endpoint: str
-    block_hashes: frozenset[int]
+    # Router prefix order, de-duplicated; prefetch admits in this order.
+    block_hashes: tuple[int, ...]
     destination: CacheTier
 
 
@@ -71,9 +72,9 @@ _DESTINATION_MEDIA = {"GPU": CacheTier.FW_G1, "CPU": CacheTier.LOCAL_G2}
 
 def _parse_destination(payload: Mapping[str, object]) -> CacheTier:
     """Map the optional ``destination`` payload object to a cache tier."""
-    if "destination" not in payload:
+    destination = payload.get("destination")
+    if destination is None:
         return CacheTier.FW_G1
-    destination = payload["destination"]
     if not isinstance(destination, Mapping):
         raise ValueError("invalid destination")
     medium = destination.get("medium")
@@ -112,7 +113,7 @@ def _parse_kv_fetch(
     if not isinstance(source, str) or not source or not isinstance(block_hashes, list):
         raise ValueError("invalid router hint")
 
-    hashes: set[int] = set()
+    hashes: dict[int, None] = {}
     for block_hash in block_hashes:
         if (
             isinstance(block_hash, bool)
@@ -120,12 +121,12 @@ def _parse_kv_fetch(
             or not 0 <= block_hash < 1 << 64
         ):
             raise ValueError("invalid router hint")
-        hashes.add(block_hash)
+        hashes[block_hash] = None
     if not hashes:
         raise ValueError("invalid router hint")
 
     return _KVFetchAction(
-        action_id, source, frozenset(hashes), _parse_destination(fetch_payload)
+        action_id, source, tuple(hashes), _parse_destination(fetch_payload)
     )
 
 
@@ -203,21 +204,3 @@ def parse_hint_actions(
     if not parsed:
         raise ValueError("invalid router hint")
     return parsed
-
-
-class _KVFetchHint(msgspec.Struct, frozen=True):
-    """Fields KVCR currently supports from the first ``FW_G1`` fetch action."""
-
-    source_endpoint: str
-    block_hashes: frozenset[int]
-
-    @classmethod
-    def from_hint(cls, hint: Mapping[str, object] | msgspec.Struct) -> _KVFetchHint:
-        """Parse and validate a KV hint envelope."""
-        for action in parse_hint_actions(hint):
-            if (
-                isinstance(action, _KVFetchAction)
-                and action.destination is CacheTier.FW_G1
-            ):
-                return cls(action.source_endpoint, action.block_hashes)
-        raise ValueError("invalid router hint")
