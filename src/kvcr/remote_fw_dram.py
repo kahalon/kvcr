@@ -509,6 +509,16 @@ class _RemoteFWDram:
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
             raise ValueError("metadata_retry_interval_ms must be positive")
+        if options.prefetch_timeout_ms <= 0:
+            raise ValueError("prefetch_timeout_ms must be positive")
+        if options.prefetch_blocks_per_op <= 0:
+            raise ValueError("prefetch_blocks_per_op must be positive")
+        if options.max_queued_prefetch_blocks < 0:
+            raise ValueError("max_queued_prefetch_blocks must be non-negative")
+        if options.prefetch_admit_blocks_per_poll <= 0:
+            raise ValueError("prefetch_admit_blocks_per_poll must be positive")
+        if not 0 <= options.prefetch_reserve_limit_percent <= 100:
+            raise ValueError("prefetch_reserve_limit_percent must be in [0, 100]")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
         self._kvcr = kvcr

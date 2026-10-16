@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Construction and integration configuration for KVCR."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -48,6 +48,13 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
     backend: str = "UCX"
+    prefetch_may_evict: bool = True
+    prefetch_timeout_ms: int = 5000
+    prefetch_blocks_per_op: int = 64
+    prefetch_layout: tuple[str, ...] | None = None
+    max_queued_prefetch_blocks: int = 4096
+    prefetch_admit_blocks_per_poll: int = 256
+    prefetch_reserve_limit_percent: float = 25
 
 
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):
@@ -112,6 +119,14 @@ class KeyAdapter(Protocol):
     def encode(self, framework_key: object) -> BlockKey: ...
 
     def decode(self, key: BlockKey) -> int | bytes: ...
+
+    def keys_for_block_hash(self, block_hash: int) -> Sequence[BlockKey]:
+        """Return the keys for a framework block hash.
+
+        Optional: integrations may omit this method; callers probe it with
+        ``getattr(adapter, "keys_for_block_hash", None)``.
+        """
+        ...
 
 
 class KVCRConfig(msgspec.Struct, frozen=True):

@@ -318,6 +318,14 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
+        prefetch_layout = backend_configs.remote_fw_dram.prefetch_layout
+        self._prefetch_layout: list[str] | None = (
+            list(prefetch_layout) if prefetch_layout is not None else None
+        )
+        if self._prefetch_layout is not None:
+            self._validate_block_layout(
+                self._prefetch_layout, "prefetch_layout must use configured pools"
+            )
         kvcr_regions = (
             {region.label: region for region in self._local_dram.memory_regions}
             if self._local_dram is not None

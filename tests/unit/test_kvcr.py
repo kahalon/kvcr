@@ -1042,3 +1042,56 @@ def test_named_reference_validation_and_address_reporting():
             config,
             framework_regions=[regions[0], regions[0]],
         )
+
+
+def test_remote_options_prefetch_defaults():
+    options = RemoteFWDramOptions()
+    assert (options.prefetch_may_evict, options.prefetch_timeout_ms) == (True, 5000)
+    assert (options.prefetch_blocks_per_op, options.prefetch_layout) == (64, None)
+    assert options.max_queued_prefetch_blocks == 4096
+    assert options.prefetch_admit_blocks_per_poll == 256
+    assert options.prefetch_reserve_limit_percent == 25
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("prefetch_timeout_ms", 0),
+        ("prefetch_blocks_per_op", 0),
+        ("max_queued_prefetch_blocks", -1),
+        ("prefetch_admit_blocks_per_poll", 0),
+        ("prefetch_reserve_limit_percent", 101),
+        ("prefetch_layout", ("missing-pool",)),
+    ],
+)
+def test_remote_options_prefetch_validation(field, value):
+    with pytest.raises(ValueError):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            remote_options=RemoteFWDramOptions(**{field: value}),
+        )
+
+
+def test_remote_options_prefetch_layout_valid():
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        remote_options=RemoteFWDramOptions(prefetch_layout=("",)),
+    )
+    try:
+        assert kvcr._core._prefetch_layout == [""]
+    finally:
+        kvcr.close()
+
+
+def test_remote_options_prefetch_layout_empty_rejected():
+    with pytest.raises(ValueError):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            remote_options=RemoteFWDramOptions(prefetch_layout=()),
+        )
