@@ -77,6 +77,8 @@ the future.
 
 - Dynamo KV Router — supported
 
+A `kv.fetch` action may carry an optional `destination` object whose `medium` is `GPU` (the default), `CPU`, or `STORAGE`. `CPU` asks KVCR to prefetch the blocks into its local DRAM, `GPU` keeps the existing engine path, and `STORAGE` is rejected. See [Composable KV hints](docs/composable_hints_design.md).
+
 ### Engine support
 
 - TRT-LLM

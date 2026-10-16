@@ -558,6 +558,13 @@ The important fields are:
 | `operation_timeout_ms` | Deadline for KVCR operations; timeout begins cancellation and cleanup |
 | `abandon_timeout_ms` | Deadline from operation start to report unresolved memory as uncertain; default `5000`, at least twice `operation_timeout_ms` |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
+| `prefetch_may_evict` | Whether a prefetch may evict READY blocks to make room; default `true` |
+| `prefetch_timeout_ms` | Deadline for a prefetch action, also used to drop stale queued actions; default `5000` |
+| `prefetch_blocks_per_op` | Maximum keys in one prefetch pull; default `64` |
+| `prefetch_layout` | Layout of prefetched blocks; must match the engine's `expected_layout` and is required for CPU-destination actions; default unset |
+| `max_queued_prefetch_blocks` | Cap on keys waiting for admission; further actions are dropped; default `4096` |
+| `prefetch_admit_blocks_per_poll` | Keys admitted per `poll_completed` call; default `256` |
+| `prefetch_reserve_limit_percent` | Share of each pool's slots that unfinished prefetch fills may hold; default `25` |
 
 The last seven rows (the `prefetch_*` fields and `max_queued_prefetch_blocks`)
 are `RemoteFWDramOptions` fields; plumbing them through vLLM's
