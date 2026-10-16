@@ -101,7 +101,10 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
 
     assert list(target.poll_completed()) == []
     _wait_until(lambda: bool(control.sent))
-    assert _decode_control_message(control.sent[0][1])["keys"] == [requested_key]
+    deliver_message = _decode_control_message(control.sent[0][1])
+    assert deliver_message["keys"] == [requested_key]
+    # Engine pulls omit op_class so older sources keep their default timeout.
+    assert "op_class" not in deliver_message
     target.discard_hint("req")
     assert target.query((requested_key,), "req") == [(QueryStatus.MISS, None)]
     agent.notifs["source"] = [_write_done_notification(op_handle)]
@@ -373,6 +376,7 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     fetch = target.fetch(keys, request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
+    assert "op_class" not in message
     # Malformed handles must not fail the fill or discard its valid completion.
     agent.notifs["source"] = [
         b"KVCR:"
@@ -1327,4 +1331,60 @@ def test_remote_framework_dram_transfers_available_keys(
     )
     assert any(
         "target_transfer_completed" in event and completed in event for event in events
+    )
+
+
+def test_prefetch_pull_names_source_and_op_class(monkeypatch, caplog):
+    monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    local = ctypes.create_string_buffer(16 * 2)
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        remote_options=RemoteFWDramOptions(
+            eager_ctrl_connect=False, prefetch_timeout_ms=5000
+        ),
+    )
+    core = kvcr._core
+    key = BlockKey(b"p0")
+    with core._state_lock:
+        core._block_record(key)
+        destinations, pending = core._local_dram.reserve_fill(
+            (key,),
+            sources={key: CacheTier.REMOTE_G2},
+            required_local=False,
+            deadline=core._clock() + 5,
+            layout=[""],
+        )
+        assert not pending
+        handle = core._next_fill_handle
+        core._next_fill_handle -= 1
+        assert core._remote_fw_dram.prefetch(
+            "tcp://source:1", destinations, core._clock() + 5, op_handle=handle
+        )
+    _wait_until(lambda: bool(control.sent))
+    endpoint, message = control.sent[0]
+    decoded = _decode_control_message(message)
+    assert endpoint == "tcp://source:1"
+    assert decoded["op_class"] == "prefetch"
+    assert decoded["allow_layout_subset"] is False
+    assert 4000 < decoded["remaining_timeout_ms"] <= 5000
+    agent.notifs["source"] = [_write_done_notification(handle)]
+    _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
+    assert kvcr.query((key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    assert any(r["event"] == "remote_prefetch_completed" for r in _key_history(caplog))
+
+
+def test_prefetch_pull_with_no_blocks_is_not_submitted():
+    kvcr = _new_kvcr(
+        FakeNixlAgent(metadata=b"target-md"),
+        FakePrimaryPinning(),
+        FakeBytesControl("tcp://target:1"),
+    )
+    assert not kvcr._core._remote_fw_dram.prefetch(
+        "tcp://source:1", {}, kvcr._core._clock() + 5, op_handle=-1
     )

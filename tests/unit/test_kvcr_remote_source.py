@@ -30,7 +30,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.config import KVCRConfig, LocalDramOptions
+from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.progress import _STOP, _TransferRef
 from kvcr.remote_fw_dram import (
@@ -1426,3 +1426,47 @@ def test_route_setup_propagates_cleanup_errors(message_type) -> None:
     assert str(error.value.__cause__) == "route busy"
     assert sticky.remote_agents == [b"gen-1"]
     assert tier._route_generation == {}
+
+
+@pytest.mark.parametrize(
+    ("op_class", "remaining_timeout_ms", "expected_s"),
+    [
+        ("prefetch", 4000, 4.0),
+        # The prefetch clamp caps a longer remaining timeout.
+        ("prefetch", 8000, 5.0),
+        (None, 4000, 1.0),
+        ("other", 4000, 1.0),
+        (7, 4000, 1.0),
+    ],
+)
+def test_start_write_op_class_selects_source_timeout(
+    monkeypatch, op_class, remaining_timeout_ms, expected_s
+) -> None:
+    """Only a prefetch op_class applies the prefetch timeout on the source."""
+    created: list[_SourcePinOp] = []
+
+    class _Capture(_SourcePinOp):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr("kvcr.remote_fw_dram._SourcePinOp", _Capture)
+    control = FakeBytesControl()
+    source = _new_kvcr(
+        FakeNixlAgent(metadata=b"source-md"),
+        PendingPrimaryPinning(),
+        control,
+        remote_options=RemoteFWDramOptions(prefetch_timeout_ms=5000),
+        name="source",
+    )
+    source._core._clock = lambda: 0.0
+    message = msgspec.msgpack.decode(
+        _start_write_message(
+            9, BlockKey(b"k0"), remaining_timeout_ms=remaining_timeout_ms
+        )
+    )
+    if op_class is not None:
+        message["op_class"] = op_class
+    control.incoming.append(msgspec.msgpack.encode(message))
+    _poll_until(source, lambda _: bool(created))
+    assert created[0].deadline == pytest.approx(expected_s)

@@ -559,6 +559,10 @@ The important fields are:
 | `abandon_timeout_ms` | Deadline from operation start to report unresolved memory as uncertain; default `5000`, at least twice `operation_timeout_ms` |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
 
+The last seven rows (the `prefetch_*` fields and `max_queued_prefetch_blocks`)
+are `RemoteFWDramOptions` fields; plumbing them through vLLM's
+`--kv-transfer-config` is pending in the vLLM integration.
+
 For several local DP ranks, provide one `control_ports` entry per local rank in
 local-rank order. Every worker must advertise an address reachable from its
 peers, and every port must be unique on that host.

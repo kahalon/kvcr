@@ -115,6 +115,13 @@ class _TargetPullOp(_RemoteOp):
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    op_class: str | None = None
+
+    @property
+    def scope(self) -> str:
+        if self.op_class == "prefetch":
+            return "remote_prefetch"
+        return "remote_fetch" if self.local_fill else "remote_deliver"
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -122,7 +129,7 @@ class _TargetPullOp(_RemoteOp):
         backend = self._backend
         now = backend._kvcr._clock()
         cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
-        scope = "remote_fetch" if self.local_fill else "remote_deliver"
+        scope = self.scope
         if self.state is _TargetPullState.START_WRITE:
             self.source_incarnation = backend._dangling_ops.sources.get(
                 self.remote_ctrl_ep
@@ -132,19 +139,18 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
-            sent = backend._send_control(
-                progress,
-                self.remote_ctrl_ep,
-                {
-                    "type": "start_write",
-                    "op_handle": self.op_id[1],
-                    "remaining_timeout_ms": (self.deadline - now) * 1000,
-                    "source_incarnation": self.source_incarnation,
-                    "keys": list(self.ordered_keys),
-                    "dst_descriptors": self.dst_descriptors,
-                    "allow_layout_subset": not self.local_fill,
-                },
-            )
+            message: dict[str, Any] = {
+                "type": "start_write",
+                "op_handle": self.op_id[1],
+                "remaining_timeout_ms": (self.deadline - now) * 1000,
+                "source_incarnation": self.source_incarnation,
+                "keys": list(self.ordered_keys),
+                "dst_descriptors": self.dst_descriptors,
+                "allow_layout_subset": not self.local_fill,
+            }
+            if self.op_class is not None:
+                message["op_class"] = self.op_class
+            sent = backend._send_control(progress, self.remote_ctrl_ep, message)
             if not sent:
                 self.success = False
                 self.state = _TargetPullState.FINISHED
@@ -600,6 +606,76 @@ class _RemoteFWDram:
             return False
         return True
 
+    def _resolve_hint_source(
+        self,
+        request_id: str | None,
+        blocks: Mapping[BlockKey, list[_TransferRef]],
+        scope: str,
+        started_at: float,
+    ) -> tuple[str, tuple[BlockKey, ...]] | None:
+        """Return the hinted source peer and the keys to request from it."""
+        kvcr = self._kvcr
+        current_hint = (
+            self._request_hints.get(request_id) if request_id is not None else None
+        )
+        if current_hint is not None and (
+            current_hint.failed or current_hint.missing_keys.issuperset(blocks)
+        ):
+            kvcr._record_duration(scope, started_at, "failed")
+            return None
+
+        if current_hint is None or current_hint.source is None:
+            kvcr._record_duration(scope, started_at, "failed")
+            return None
+        keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
+        kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
+        if request_id is not None:
+            self._request_hints[request_id] = replace(current_hint, submitted_at=None)
+        return current_hint.source, keys
+
+    def _submit_target_pull(
+        self,
+        source: str,
+        keys: tuple[BlockKey, ...],
+        blocks: Mapping[BlockKey, list[_TransferRef]],
+        request_id: str | None,
+        deadline: float,
+        op_handle: OpHandle,
+        *,
+        local_fill: bool,
+        op_class: str | None,
+        started_at: float | None = None,
+    ) -> bool:
+        kvcr = self._kvcr
+        op = _TargetPullOp(
+            state=_TargetPullState.START_WRITE,
+            local_fill=local_fill,
+            keys=frozenset(blocks),
+            started_at=kvcr._timer() if started_at is None else started_at,
+            deadline=deadline,
+            op_id=("target", op_handle),
+            remote_ctrl_ep=source,
+            _backend=self,
+            ordered_keys=keys,
+            dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
+            request_id=request_id,
+            op_class=op_class,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KVCR_EVENT target_transfer_started scope=%s request_id=%s op=%d "
+                "source=%s blocks=%d bytes=%d",
+                op.scope,
+                request_id,
+                op_handle,
+                source,
+                len(keys),
+                kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
+            )
+        kvcr._add_block_dependencies(op, new_operation=True)
+        kvcr._progress.submit(op)
+        return True
+
     def _start_target_pull(
         self,
         blocks: Mapping[BlockKey, list[_TransferRef]],
@@ -609,53 +685,45 @@ class _RemoteFWDram:
         *,
         local_fill: bool,
     ) -> bool:
-        kvcr = self._kvcr
-        started_at = kvcr._timer()
+        started_at = self._kvcr._timer()
         scope = "remote_fetch" if local_fill else "remote_deliver"
-        current_hint = (
-            self._request_hints.get(request_id) if request_id is not None else None
-        )
-        if current_hint is not None and (
-            current_hint.failed or current_hint.missing_keys.issuperset(blocks)
-        ):
-            kvcr._record_duration(scope, started_at, "failed")
+        resolved = self._resolve_hint_source(request_id, blocks, scope, started_at)
+        if resolved is None:
             return False
-
-        if current_hint is None or current_hint.source is None:
-            kvcr._record_duration(scope, started_at, "failed")
-            return False
-        keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
-        kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
-        if request_id is not None:
-            self._request_hints[request_id] = replace(current_hint, submitted_at=None)
-
-        op = _TargetPullOp(
-            state=_TargetPullState.START_WRITE,
+        source, keys = resolved
+        return self._submit_target_pull(
+            source,
+            keys,
+            blocks,
+            request_id,
+            deadline,
+            op_handle,
             local_fill=local_fill,
-            keys=frozenset(blocks),
+            op_class=None,
             started_at=started_at,
-            deadline=deadline,
-            op_id=("target", op_handle),
-            remote_ctrl_ep=current_hint.source,
-            _backend=self,
-            ordered_keys=keys,
-            dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
-            request_id=request_id,
         )
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "KVCR_EVENT target_transfer_started scope=%s request_id=%s op=%d "
-                "source=%s blocks=%d bytes=%d",
-                scope,
-                request_id,
-                op_handle,
-                current_hint.source,
-                len(keys),
-                kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
-            )
-        kvcr._add_block_dependencies(op, new_operation=True)
-        kvcr._progress.submit(op)
-        return True
+
+    def prefetch(
+        self,
+        source: str,
+        blocks: Mapping[BlockKey, list[_TransferRef]],
+        deadline: float,
+        *,
+        op_handle: OpHandle,
+    ) -> bool:
+        """Pull ``blocks`` from ``source`` into local fill destinations."""
+        if not blocks:
+            return False
+        return self._submit_target_pull(
+            source,
+            tuple(blocks),
+            blocks,
+            None,
+            deadline,
+            op_handle,
+            local_fill=True,
+            op_class="prefetch",
+        )
 
     def deliver(
         self,
@@ -808,9 +876,11 @@ class _RemoteFWDram:
         completed_keys = op.completed_keys if op.success else set()
         if kvcr._key_history_enabled:
             kvcr._log_key_history(
-                "remote_fetch_completed"
-                if op.local_fill
-                else "remote_deliver_completed",
+                {
+                    "remote_prefetch": "remote_prefetch_completed",
+                    "remote_fetch": "remote_fetch_completed",
+                    "remote_deliver": "remote_deliver_completed",
+                }[op.scope],
                 (key for key in op.ordered_keys if key in completed_keys),
                 CacheTier.REMOTE_G2,
                 request_id=op.request_id,
@@ -1125,9 +1195,14 @@ class _RemoteFWDram:
             self._notify_start_write_failure(progress, payload, op_handle)
             return
 
+        op_class = payload.get("op_class")
+        if not isinstance(op_class, str):
+            op_class = None
         remaining_timeout_ms = min(
             float(remaining_timeout_ms),
-            self._kvcr.config.operation_timeout_ms,
+            self._options.prefetch_timeout_ms
+            if op_class == "prefetch"
+            else self._kvcr.config.operation_timeout_ms,
         )
         deadline = received_at + remaining_timeout_ms / 1000
         try:
