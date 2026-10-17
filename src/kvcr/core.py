@@ -23,7 +23,7 @@ from .config import (
     TelemetryStats,
     _validate_pool_layouts,
 )
-from .hint_parser import _KVFetchHint
+from .hints.dispatcher import HintDispatcher
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
@@ -268,6 +268,9 @@ class _KVCRCore:
         stats_factory = self._stats_factory if self.config.enable_telemetry else None
         telemetry_enabled = stats_factory is not None
         self._stats = stats_factory() if stats_factory is not None else None
+        # Hint handlers and results; which handlers exist is the dispatcher's
+        # registry, not core's business.
+        self._hints_dispatcher = HintDispatcher(self)
         self._timer: _Timer = time.monotonic if telemetry_enabled else _noop_timer
         self._record_duration: _RecordDuration = (
             self._record_duration_enabled
@@ -424,10 +427,7 @@ class _KVCRCore:
         hints: Mapping[str, object] | msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
-        hint = _KVFetchHint.from_hint(hints)
-        self._remote_fw_dram.submit_hint(
-            hint.source_endpoint, hint.block_hashes, request_id
-        )
+        self._hints_dispatcher.submit(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_fw_dram.discard_hint(request_id)
@@ -715,6 +715,9 @@ class _KVCRCore:
     def close(self) -> None:
         if self._closed:
             return
+        # Hint handlers close first, before anything that can raise.
+        with self._state_lock:
+            self._hints_dispatcher.close()
         # Assumption: the framework drains submitted jobs before close.
         progress_error: BaseException | None = None
         try:

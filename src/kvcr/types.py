@@ -111,6 +111,21 @@ class OpEntryResult(msgspec.Struct, frozen=True):
 OpResult = tuple[OpHandle, Mapping[BlockKey, OpEntryResult]]
 
 
+class HintStatus(Enum):
+    # Inline hints are terminal at submit time: ACCEPTED or REJECTED only.
+    ACCEPTED = "ACCEPTED"  # inline work done
+    REJECTED = "REJECTED"  # invalid, unsupported, handler_error
+
+
+class HintResult(msgspec.Struct, frozen=True):
+    action_id: str | None
+    action_type: str
+    status: HintStatus
+    reason: str | None = None
+    request_id: str | None = None
+    message_id: str | None = None
+
+
 class QueryStatus(Enum):
     HIT = "HIT"
     FETCHING = "FETCHING"
