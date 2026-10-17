@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """kv.fetch hint handler tests: the engine-destination inline path."""
 
-import logging
-
 import pytest
 from _kvcr_test_utils import (
     FakeBytesControl,
@@ -107,53 +105,46 @@ def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch):
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, "req")]
 
 
-def test_same_source_fetch_hints_union_hashes(monkeypatch):
-    kvcr, results = _fetch_kvcr(monkeypatch)
-    kvcr.submit_hint(
-        _fetch_envelope(_fetch("a1", "tcp://a:1", [1]), _fetch("a2", "tcp://a:1", [2])),
-        "req",
-    )
-    assert kvcr.query((_key(1), _key(2)), "req") == [_FETCHABLE, _FETCHABLE]
-    assert [r.status for r in results] == [HintStatus.ACCEPTED] * 2
-
-
-def test_first_fetch_source_wins_within_envelope(monkeypatch, caplog):
+def test_second_same_source_hint_in_envelope_replaces_hashes(monkeypatch):
     kvcr, results = _fetch_kvcr(monkeypatch)
     calls = []
     remote = kvcr._core._remote_fw_dram
     real = remote.submit_hint
     remote.submit_hint = lambda *a: (calls.append(a), real(*a))[1]
-    with caplog.at_level(logging.WARNING):
-        kvcr.submit_hint(
-            _fetch_envelope(
-                _fetch("a1", "tcp://a:1", [1]),
-                _fetch("b1", "tcp://b:1", [2]),
-                _fetch("a2", "tcp://a:1", [3]),
-            ),
-            "req",
-        )
-    assert len(calls) == 1
-    hint = remote._request_hints["req"]
-    assert hint.source == "tcp://a:1" and not hint.failed
-    assert kvcr.query((_key(1), _key(2), _key(3)), "req") == [
-        _FETCHABLE,
-        _MISS,
-        _FETCHABLE,
-    ]
+    kvcr.submit_hint(
+        _fetch_envelope(_fetch("a1", "tcp://a:1", [1]), _fetch("a2", "tcp://a:1", [2])),
+        "req",
+    )
+    # One store call per hint; the store keeps the last hashes, as across calls.
+    assert len(calls) == 2
     assert _take(results) == [
         ("a1", HintStatus.ACCEPTED, None),
-        ("b1", HintStatus.REJECTED, "multiple_sources"),
         ("a2", HintStatus.ACCEPTED, None),
     ]
-    assert sum("multiple_sources" in m for m in caplog.messages) == 1
+    assert kvcr.query((_key(1), _key(2)), "req") == [_MISS, _FETCHABLE]
 
 
-def test_second_source_in_later_hint_is_rejected_and_poisons(monkeypatch):
+def test_second_source_in_envelope_fails_request(monkeypatch):
+    kvcr, results = _fetch_kvcr(monkeypatch)
+    kvcr.submit_hint(
+        _fetch_envelope(_fetch("a1", "tcp://a:1", [1]), _fetch("b1", "tcp://b:1", [2])),
+        "req",
+    )
+    # The store does not report the conflict; it fails the request as before.
+    assert _take(results) == [
+        ("a1", HintStatus.ACCEPTED, None),
+        ("b1", HintStatus.ACCEPTED, None),
+    ]
+    assert kvcr._core._remote_fw_dram._request_hints["req"].failed is True
+    assert kvcr.query((_key(1), _key(2)), "req") == [_MISS, _MISS]
+
+
+def test_second_source_in_later_hint_fails_request(monkeypatch):
     kvcr, results = _fetch_kvcr(monkeypatch)
     kvcr.submit_hint(_fetch_envelope(_fetch("a1", "tcp://a:1", [1])), "req")
     assert _take(results) == [("a1", HintStatus.ACCEPTED, None)]
     kvcr.submit_hint(_fetch_envelope(_fetch("b1", "tcp://b:1", [2])), "req")
-    assert _take(results) == [("b1", HintStatus.REJECTED, "multiple_sources")]
+    assert _take(results) == [("b1", HintStatus.ACCEPTED, None)]
     assert kvcr._core._remote_fw_dram._request_hints["req"].failed is True
 
 

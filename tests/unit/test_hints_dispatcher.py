@@ -63,20 +63,19 @@ class _StubHandler:
         self.close_calls = 0
         self.raise_on_submit = False
 
-    def submit(self, hints, request_id, message_id) -> None:
+    def submit(self, hint, request_id, message_id) -> None:
         if self.raise_on_submit:
             raise RuntimeError("submit boom")
-        self.submitted.extend(hints)
-        for hint in hints:
-            self.dispatcher.report(
-                HintResult(
-                    action_id=hint.action_id,
-                    action_type=self.action_type,
-                    status=HintStatus.ACCEPTED,
-                    request_id=request_id,
-                    message_id=message_id,
-                )
+        self.submitted.append(hint)
+        self.dispatcher.report(
+            HintResult(
+                action_id=hint.action_id,
+                action_type=self.action_type,
+                status=HintStatus.ACCEPTED,
+                request_id=request_id,
+                message_id=message_id,
             )
+        )
 
     def close(self) -> None:
         self.close_calls += 1

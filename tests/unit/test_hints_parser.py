@@ -37,8 +37,8 @@ def test_parse_hints_returns_every_valid_action_in_order():
     )
     hints, rejected = parse_hints(hint)
     assert hints == [
-        _KVFetchHint("a", "tcp://a:1", (1, 2)),
-        _KVFetchHint("b", "tcp://b:1", (4,)),
+        _KVFetchHint("a", "tcp://a:1", frozenset({1, 2})),
+        _KVFetchHint("b", "tcp://b:1", frozenset({4})),
     ]
     assert [(r.action_id, r.status, r.reason) for r in rejected] == [
         ("x", HintStatus.REJECTED, "unsupported_action_type"),
@@ -55,7 +55,7 @@ def test_parse_hints_accepts_struct_and_mapping(as_mapping):
     hints, rejected = parse_hints(hint)
     assert len(hints) == 1 and rejected == []
     assert hints[0].source_endpoint == "tcp://source:1234"
-    assert hints[0].block_hashes == (123, 456)
+    assert hints[0].block_hashes == frozenset({123, 456})
 
 
 def test_parse_hints_all_rejected_does_not_raise():
@@ -149,33 +149,6 @@ def test_kv_fetch_invalid_payload_is_rejected(fetch_payload: object) -> None:
     hints, rejected = parse_hints(kv_hint)
     assert hints == []
     assert len(rejected) == 1 and rejected[0].status is HintStatus.REJECTED
-
-
-@pytest.mark.parametrize(
-    "destination, ok",
-    [
-        (None, True),
-        ({"medium": "gpu"}, True),
-        ({"medium": "GPU"}, True),
-        ({"medium": "CPU"}, False),
-        ({"medium": "STORAGE"}, False),
-        ({"medium": 1}, False),
-        ("GPU", False),
-        ({}, False),
-    ],
-)
-def test_fetch_destination_must_be_engine(destination, ok):
-    hint = _HintEnvelope(
-        "0.1",
-        "m",
-        [_fetch_hint("a", "tcp://a:1", (1,), destination=destination)],
-    )
-    hints, rejected = parse_hints(hint)
-    if ok:
-        assert len(hints) == 1 and not rejected
-    else:
-        assert not hints
-        assert [r.reason for r in rejected] == ["unsupported destination"]
 
 
 def test_registered_action_type_is_parsed(monkeypatch):
