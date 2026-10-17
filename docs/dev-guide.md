@@ -186,10 +186,12 @@ transfer deadlines are unchanged.
 For `on_resilience_event` and optional framework-memory quarantine, see the
 [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 
-Each hint in a `submit_hint` envelope produces a
+`poll_completed` also admits deferred hints, so an adapter must keep
+calling it while idle. Each hint in a `submit_hint` envelope produces an
 `HintResult` that is recorded in the `kvcr_hints` telemetry counter;
-results are not retained. See the
-[composable hint handling](composable_hints.md) for statuses.
+results are not retained by default and there is no public drain yet. See the
+[composable hint handling](composable_hints.md) for statuses and queue
+bounds.
 
 See the design doc's [Framework–KVCR API](design_overview.md#frameworkkvcr-api)
 and [operating flow](design_overview.md#operating-flow) for query, transfer,
@@ -561,8 +563,16 @@ The important fields are:
 | `local_dram_backend` | NIXL backend used for local DRAM transfers |
 | `remote_fw_dram_backend` | NIXL backend used for peer DRAM transfers |
 | `operation_timeout_ms` | Deadline for KVCR operations; timeout begins cancellation and cleanup |
+| `max_queued_hints` | Bound on deferred hints waiting for admission; default `1024` |
+| `hints_per_poll` | Deferred hints admitted per `poll_completed`; default `64` |
+| `hint_timeout_ms` | Age after which a queued hint expires as stale; default `5000` |
+| `max_hint_results` | Retained hint results; default `0` (none retained, telemetry only); set when a consumer drains that do not drain |
 | `abandon_timeout_ms` | Deadline from operation start to report unresolved memory as uncertain; default `5000`, at least twice `operation_timeout_ms` |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
+
+The four hint fields (`max_queued_hints` through
+`max_hint_results`) are `KVCRConfig` fields; their `--kv-transfer-config`
+plumbing is pending in the vLLM integration.
 
 For several local DP ranks, provide one `control_ports` entry per local rank in
 local-rank order. Every worker must advertise an address reachable from its
