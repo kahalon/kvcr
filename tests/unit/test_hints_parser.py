@@ -151,6 +151,33 @@ def test_kv_fetch_invalid_payload_is_rejected(fetch_payload: object) -> None:
     assert len(rejected) == 1 and rejected[0].status is HintStatus.REJECTED
 
 
+@pytest.mark.parametrize(
+    "destination, ok",
+    [
+        (None, True),
+        ({"medium": "gpu"}, True),
+        ({"medium": "GPU"}, True),
+        ({"medium": "CPU"}, False),
+        ({"medium": "STORAGE"}, False),
+        ({"medium": 1}, False),
+        ("GPU", False),
+        ({}, False),
+    ],
+)
+def test_fetch_destination_must_be_engine(destination, ok):
+    hint = _HintEnvelope(
+        "0.1",
+        "m",
+        [_fetch_hint("a", "tcp://a:1", (1,), destination=destination)],
+    )
+    hints, rejected = parse_hints(hint)
+    if ok:
+        assert len(hints) == 1 and not rejected
+    else:
+        assert not hints
+        assert [r.reason for r in rejected] == ["unsupported destination"]
+
+
 def test_registered_action_type_is_parsed(monkeypatch):
     class _Stub(msgspec.Struct, frozen=True):
         ACTION_TYPE: ClassVar[str] = "kv.stub"

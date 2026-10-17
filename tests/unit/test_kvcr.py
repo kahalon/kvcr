@@ -1044,3 +1044,30 @@ def test_named_reference_validation_and_address_reporting():
             config,
             framework_regions=[regions[0], regions[0]],
         )
+
+
+def test_hint_config_defaults():
+    config = KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)])
+    assert config.max_queued_hints == 1024
+    assert config.hints_per_poll == 64
+    assert config.hint_timeout_ms == 5000
+    assert config.max_hint_results == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_queued_hints", -1),
+        ("hints_per_poll", 0),
+        ("hint_timeout_ms", 0),
+        ("max_hint_results", -1),
+    ],
+)
+def test_hint_config_validation(field, value):
+    config = KVCRConfig(
+        nixl_agent_name="target", pool_layouts=[("", 16)], **{field: value}
+    )
+    with pytest.raises(ValueError, match=field):
+        _new_kvcr(
+            FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl(), config=config
+        )

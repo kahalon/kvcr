@@ -11,18 +11,22 @@ from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
+    FakeTelemetryStats,
     _HintAction,
     _HintEnvelope,
     _new_kvcr,
     _record_hint_results,
 )
 
+from kvcr import STATE_METRIC
 from kvcr.config import KVCRConfig
 from kvcr.hints.dispatcher import (
     _HANDLER_FACTORIES,
     _LOGGED_HANDLER_ERRORS,
+    HINT_RESULTS_DISCARDED_METRIC,
     HINTS_METRIC,
     HintDispatcher,
+    _HintResults,
 )
 from kvcr.hints.parser import _HINT_PARSERS, _LOGGED_HINT_ISSUES
 from kvcr.types import HintResult, HintStatus
@@ -52,30 +56,54 @@ class _UnhandledHint(msgspec.Struct, frozen=True):
 
 
 class _StubHandler:
-    """Inline handler that accepts every hint it is given."""
+    """Accepts every hint inline, or defers every hint when ``defer`` is set."""
 
     action_type = "kv.test"
 
-    def __init__(self, core, dispatcher) -> None:
+    def __init__(self, core, dispatcher, *, defer: bool = False) -> None:
         self.core = core
         self.dispatcher = dispatcher
+        self.defer = defer
         self.submitted: list[_StubHint] = []
+        self.deferred: list[bool] = []
+        self.admit_calls: list[str | None] = []
+        self.admitted: list[str | None] = []
+        self.refuse: set[str | None] = set()
+        self.raise_on: set[str | None] = set()
         self.close_calls = 0
         self.raise_on_submit = False
+
+    @property
+    def closed(self) -> bool:
+        return self.close_calls > 0
 
     def submit(self, hint, request_id, message_id) -> None:
         if self.raise_on_submit:
             raise RuntimeError("submit boom")
         self.submitted.append(hint)
-        self.dispatcher.report(
-            HintResult(
-                action_id=hint.action_id,
-                action_type=self.action_type,
-                status=HintStatus.ACCEPTED,
-                request_id=request_id,
-                message_id=message_id,
+        if self.defer:
+            self.deferred.append(
+                self.dispatcher.defer(self, hint, request_id, message_id)
             )
-        )
+        else:
+            self.dispatcher.report(
+                HintResult(
+                    action_id=hint.action_id,
+                    action_type=self.action_type,
+                    status=HintStatus.ACCEPTED,
+                    request_id=request_id,
+                    message_id=message_id,
+                )
+            )
+
+    def admit(self, hint, request_id, message_id, now) -> bool:
+        self.admit_calls.append(hint.action_id)
+        if hint.action_id in self.raise_on:
+            raise RuntimeError("boom")
+        if hint.action_id in self.refuse:
+            return False
+        self.admitted.append(hint.action_id)
+        return True
 
     def close(self) -> None:
         self.close_calls += 1
@@ -91,7 +119,7 @@ def _tests(*ids: str) -> _HintEnvelope:
     return _envelope(*((i, "kv.test") for i in ids))
 
 
-def _stub_kvcr(monkeypatch, **config_fields):
+def _stub_kvcr(monkeypatch, *, defer: bool = False, **config_fields):
     monkeypatch.setitem(_HINT_PARSERS, "kv.test", ("1.0", lambda i, p: _StubHint(i)))
     monkeypatch.setitem(
         _HINT_PARSERS, "kv.unhandled", ("1.0", lambda i, p: _UnhandledHint(i))
@@ -103,7 +131,7 @@ def _stub_kvcr(monkeypatch, **config_fields):
     monkeypatch.setitem(
         _HANDLER_FACTORIES,
         "kv.test",
-        lambda core, dispatcher: _StubHandler(core, dispatcher),
+        lambda core, dispatcher: _StubHandler(core, dispatcher, defer=defer),
     )
     kvcr = _new_kvcr(
         FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl(), config=config
@@ -117,6 +145,13 @@ def _take(results) -> list[tuple[str | None, HintStatus, str | None]]:
     taken = [(r.action_id, r.status, r.reason) for r in results]
     results.clear()
     return taken
+
+
+def _frozen_clock(kvcr) -> list[float]:
+    """Replace the core clock with a settable one; returns its single cell."""
+    now = [100.0]
+    kvcr._core._clock = lambda: now[0]
+    return now
 
 
 def test_dispatcher_owns_the_handler_registry(monkeypatch):
@@ -246,3 +281,195 @@ def test_results_are_telemetry_only_without_stats(monkeypatch):
         ("a", HintStatus.ACCEPTED, None),
         ("b", HintStatus.ACCEPTED, None),
     ]
+
+
+# Result retention.
+
+
+def test_hint_results_report_drain_and_overflow():
+    stats = FakeTelemetryStats()
+    results = _HintResults(limit=2, stats_getter=lambda: stats)
+    for i in range(3):
+        results.report(HintResult(str(i), "kv.test", HintStatus.ACCEPTED))
+    drained = results.drain()
+    assert [r.action_id for r in drained] == ["1", "2"]
+    assert results.drain() == []
+    assert ("counter", HINT_RESULTS_DISCARDED_METRIC, 1, ()) in stats.records
+    assert (
+        stats.records.count(("counter", HINTS_METRIC, 1, ("kv.test", "ACCEPTED"))) == 3
+    )
+
+
+def test_hint_results_limit_zero_retains_nothing():
+    stats = FakeTelemetryStats()
+    results = _HintResults(limit=0, stats_getter=lambda: stats)
+    for i in range(3):
+        results.report(HintResult(str(i), "kv.test", HintStatus.ACCEPTED))
+    assert results.drain() == []
+    assert stats.records == [("counter", HINTS_METRIC, 1, ("kv.test", "ACCEPTED"))] * 3
+
+
+def test_kvcr_retains_nothing_by_default(monkeypatch):
+    kvcr, _, results = _stub_kvcr(monkeypatch, enable_telemetry=True)
+    assert kvcr._core._hints_dispatcher.drain_results() == []
+    kvcr.submit_hint(_tests("a", "b"))
+    assert len(results) == 2
+    assert kvcr._core._hints_dispatcher.drain_results() == []
+    records = kvcr.get_stats().records
+    assert records.count(("counter", HINTS_METRIC, 1, ("kv.test", "ACCEPTED"))) == 2
+    assert not any(r[1] == HINT_RESULTS_DISCARDED_METRIC for r in records)
+
+
+def test_kvcr_drain_returns_retained_results_in_order(monkeypatch):
+    kvcr, _, results = _stub_kvcr(monkeypatch, max_hint_results=4096)
+    kvcr.submit_hint(_envelope(("x", "kv.missing"), ("a", "kv.test")), "req")
+    assert kvcr._core._hints_dispatcher.drain_results() == results
+    assert kvcr._core._hints_dispatcher.drain_results() == []
+
+
+# Deferred lane.
+
+
+def test_deferred_hint_is_admitted_on_poll_with_budget(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch, defer=True, hints_per_poll=2)
+    ids = [str(i) for i in range(5)]
+    kvcr.submit_hint(_tests(*ids), request_id="req")
+    assert handler.deferred == [True] * 5
+    assert _take(results) == [(i, HintStatus.ACCEPTED, None) for i in ids]
+    assert kvcr._core._hints_dispatcher.queued() == 5
+
+    kvcr.poll_completed()
+    assert handler.admit_calls == ids[:2]
+    assert handler.admitted == ids[:2]
+    kvcr.poll_completed()
+    kvcr.poll_completed()
+    assert handler.admitted == ids
+    assert kvcr._core._hints_dispatcher.queued() == 0
+    assert results == []  # Completion is the handler's to report.
+
+
+def test_deferred_admit_false_keeps_head_and_stops(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch, defer=True, hint_timeout_ms=1000)
+    now = _frozen_clock(kvcr)
+    handler.refuse.add("a")
+    kvcr.submit_hint(_tests("a"), "req")
+    now[0] += 0.6
+    kvcr.submit_hint(_tests("b"), "req")
+    results.clear()
+
+    kvcr.poll_completed()
+    assert handler.admit_calls == ["a"]
+    assert kvcr._core._hints_dispatcher.queued() == 2
+
+    now[0] += 0.6  # "a" is now older than the timeout; "b" is not.
+    kvcr.poll_completed()
+    assert _take(results) == [("a", HintStatus.DROPPED, "stale")]
+    assert handler.admit_calls == ["a", "b"]
+    assert handler.admitted == ["b"]
+    assert kvcr._core._hints_dispatcher.queued() == 0
+
+
+def test_deferred_queue_full_drops_newest(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch, defer=True, max_queued_hints=2)
+    kvcr.submit_hint(_tests("a", "b", "c"))
+    assert handler.deferred == [True, True, False]
+    assert _take(results) == [
+        ("a", HintStatus.ACCEPTED, None),
+        ("b", HintStatus.ACCEPTED, None),
+        ("c", HintStatus.DROPPED, "queue_full"),
+    ]
+    assert kvcr._core._hints_dispatcher.queued() == 2
+
+
+def test_deferred_handler_exception_is_isolated(monkeypatch, caplog):
+    kvcr, handler, results = _stub_kvcr(monkeypatch, defer=True)
+    handler.raise_on.update({"a", "b"})
+    kvcr.submit_hint(_tests("a", "b", "c"))
+    results.clear()
+    with caplog.at_level(logging.WARNING, logger="kvcr.hints.dispatcher"):
+        assert list(kvcr.poll_completed()) == []
+    assert _take(results) == [
+        ("a", HintStatus.FAILED, "handler_error"),
+        ("b", HintStatus.FAILED, "handler_error"),
+    ]
+    warnings = [r for r in caplog.records if r.name == "kvcr.hints.dispatcher"]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is not None
+    assert handler.admitted == ["c"]
+
+
+def test_deferred_handler_exceptions_count_toward_budget(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch, defer=True, hints_per_poll=2)
+    handler.raise_on.update({"a", "b", "c"})
+    kvcr.submit_hint(_tests("a", "b", "c"))
+    results.clear()
+
+    kvcr.poll_completed()
+    assert _take(results) == [
+        ("a", HintStatus.FAILED, "handler_error"),
+        ("b", HintStatus.FAILED, "handler_error"),
+    ]
+    assert handler.admit_calls == ["a", "b"]
+    assert kvcr._core._hints_dispatcher.queued() == 1
+
+    kvcr.poll_completed()
+    assert _take(results) == [("c", HintStatus.FAILED, "handler_error")]
+    assert kvcr._core._hints_dispatcher.queued() == 0
+
+
+def test_close_drains_queue_as_dropped(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch, defer=True)
+    kvcr.submit_hint(_tests("a", "b"))
+    results.clear()
+    kvcr.close()
+    assert _take(results) == [
+        ("a", HintStatus.DROPPED, "closed"),
+        ("b", HintStatus.DROPPED, "closed"),
+    ]
+    assert handler.closed
+    assert handler.admit_calls == []
+
+
+def test_close_drains_queue_even_when_close_raises(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch, defer=True)
+    kvcr.submit_hint(_tests("a", "b"))
+    results.clear()
+    monkeypatch.setattr(kvcr._core, "is_quiescent", lambda: False)
+    with pytest.raises(RuntimeError, match="not quiescent"):
+        kvcr.close()
+    assert _take(results) == [
+        ("a", HintStatus.DROPPED, "closed"),
+        ("b", HintStatus.DROPPED, "closed"),
+    ]
+    assert handler.close_calls == 1
+
+    # A deferral after the lane closed is dropped, never left queued.
+    assert not kvcr._core._hints_dispatcher.defer(handler, _StubHint("c"), None, None)
+    assert _take(results) == [("c", HintStatus.DROPPED, "closed")]
+
+    monkeypatch.undo()
+    kvcr.close()
+    assert handler.close_calls == 1
+
+
+def test_queued_gauge_reflects_queue_length(monkeypatch):
+    kvcr, _, _ = _stub_kvcr(
+        monkeypatch, defer=True, enable_telemetry=True, hints_per_poll=1
+    )
+
+    def queued_gauges():
+        return [
+            value
+            for kind, name, value, labels in kvcr.get_stats().records
+            if kind == "gauge" and name == STATE_METRIC and labels == ("hints_queued",)
+        ]
+
+    assert queued_gauges() == [0]
+    kvcr.submit_hint(_tests("a", "b"))
+    assert queued_gauges() == [2]
+    # Sampled on every snapshot, even when the queue did not change.
+    assert queued_gauges() == [2]
+    kvcr.poll_completed()
+    assert queued_gauges() == [1]
+    kvcr._core._hints_dispatcher.close()
+    assert queued_gauges() == [0]
