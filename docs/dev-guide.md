@@ -186,6 +186,11 @@ transfer deadlines are unchanged.
 For `on_resilience_event` and optional framework-memory quarantine, see the
 [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 
+Each hint in a `submit_hint` envelope produces a
+`HintResult` that is recorded in the `kvcr_hints` telemetry counter;
+results are not retained. See the
+[composable hint handling](composable_hints.md) for statuses.
+
 See the design doc's [Framework–KVCR API](design_overview.md#frameworkkvcr-api)
 and [operating flow](design_overview.md#operating-flow) for query, transfer,
 completion, and release semantics, and the
