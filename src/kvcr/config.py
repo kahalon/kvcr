@@ -123,6 +123,10 @@ class KVCRConfig(msgspec.Struct, frozen=True):
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
     startup_timeout_seconds: int | None = None
+    max_queued_hints: int = 1024
+    hints_per_poll: int = 64
+    hint_timeout_ms: int = 5000
+    max_hint_results: int = 0
 
 
 class KVCRGuardConfig(msgspec.Struct, frozen=True):

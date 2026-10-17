@@ -46,6 +46,12 @@ def _parse_kv_fetch(
     if mode != "copy":
         raise ValueError("only copy mode is currently supported")
 
+    destination = payload.get("destination")
+    if destination is not None:
+        medium = destination.get("medium") if isinstance(destination, Mapping) else None
+        if not isinstance(medium, str) or medium.upper() != "GPU":
+            raise ValueError("unsupported destination")
+
     source = payload.get("source_control_endpoint")
     if source is None:
         raise ValueError("source-less hints are not currently supported")
@@ -80,7 +86,7 @@ class _FetchHintHandler:
 
     def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
         self._core = core  # backend access only
-        self._dispatcher = dispatcher  # results
+        self._dispatcher = dispatcher  # results and deferral
 
     def submit(
         self,
@@ -103,6 +109,15 @@ class _FetchHintHandler:
                 message_id=message_id,
             )
         )
+
+    def admit(
+        self,
+        hint: _Hint,
+        request_id: str | None,
+        message_id: str | None,
+        now: float,
+    ) -> bool:
+        return True  # Never deferred.
 
     def close(self) -> None:
         pass

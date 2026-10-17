@@ -113,8 +113,11 @@ OpResult = tuple[OpHandle, Mapping[BlockKey, OpEntryResult]]
 
 class HintStatus(Enum):
     # Inline hints are terminal at submit time: ACCEPTED or REJECTED only.
-    ACCEPTED = "ACCEPTED"  # inline work done
-    REJECTED = "REJECTED"  # invalid, unsupported, handler_error
+    ACCEPTED = "ACCEPTED"  # inline work done, or deferred work queued
+    REJECTED = "REJECTED"  # never queued: invalid, unsupported, handler_error
+    COMPLETED = "COMPLETED"  # deferred work finished successfully
+    FAILED = "FAILED"  # deferred work finished unsuccessfully
+    DROPPED = "DROPPED"  # queued but never run: queue_full, stale, closed
 
 
 class HintResult(msgspec.Struct, frozen=True):

@@ -268,8 +268,8 @@ class _KVCRCore:
         stats_factory = self._stats_factory if self.config.enable_telemetry else None
         telemetry_enabled = stats_factory is not None
         self._stats = stats_factory() if stats_factory is not None else None
-        # Hint handlers and results; which handlers exist is the dispatcher's
-        # registry, not core's business.
+        # Hint handlers, deferred lane and results; which handlers exist is
+        # the dispatcher's registry, not core's business.
         self._hints_dispatcher = HintDispatcher(self)
         self._timer: _Timer = time.monotonic if telemetry_enabled else _noop_timer
         self._record_duration: _RecordDuration = (
@@ -661,6 +661,7 @@ class _KVCRCore:
         self._pending_progress_items = []
         with self._state_lock:
             if not self._closed:
+                self._hints_dispatcher.admit(self._clock())
                 if self._g3 is not None:
                     progress_items = self._g3.poll_main(progress_items)
                 if self._local_dram is not None:
@@ -703,6 +704,7 @@ class _KVCRCore:
                 "connected_remotes": self._remote_fw_dram._connected_remote_count,
                 "completed": len(self._completion_queue),
             }
+            resources.update(self._hints_dispatcher.telemetry_state())
             if self._local_dram is not None:
                 resources.update(self._local_dram.telemetry_state())
             if self._g3 is not None:
@@ -715,7 +717,8 @@ class _KVCRCore:
     def close(self) -> None:
         if self._closed:
             return
-        # Hint handlers close first, before anything that can raise.
+        # First, before anything that can raise: every queued hint gets its
+        # terminal result even when close() fails below.
         with self._state_lock:
             self._hints_dispatcher.close()
         # Assumption: the framework drains submitted jobs before close.
