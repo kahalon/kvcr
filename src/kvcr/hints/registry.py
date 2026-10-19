@@ -25,6 +25,12 @@ _HintHandlerFactory = Callable[["_KVCRCore", "HintDispatcher"], "_HintHandler"]
 
 @dataclass(frozen=True)
 class HintType:
+    """One registered hint type: how its payload is parsed and who handles it.
+
+    ``version`` is the ``action_version`` the parser understands; ``parse`` and
+    ``handler_factory`` are described on ``register_hint_type``.
+    """
+
     action_type: str
     version: str
     parse: _HintParser

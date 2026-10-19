@@ -15,6 +15,7 @@ from kvcr.types import HintStatus
 
 
 def _no_handler(core, dispatcher):
+    """Handler factory for parser-only types: parsing must never build a handler."""
     raise AssertionError("parser tests build no handlers")
 
 
