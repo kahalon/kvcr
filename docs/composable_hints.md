@@ -54,23 +54,27 @@ Every result is recorded in the `kvcr_hints` counter; nothing is
 retained, because inline results are terminal at submit time and no
 integration consumes them. A bounded, drainable result queue arrives with
 the deferred lane, whose outcomes are asynchronous. A hint whose
-`action_type` cannot be read (the hint is not a mapping, or its type is not a string) is reported
+`action_type` cannot be read (the hint is not a mapping, or its `action_id` or type is not a string) is reported
 with the sentinel `action_type="unknown"`. A hint reaches a terminal status
 (`ACCEPTED` or `REJECTED`) at submit time; a handler that raises has its
 hints reported `REJECTED` with reason `handler_error`. A fatal KVCR failure
 (the progress thread failed) is not a hint result: `submit_hint` and
 `submit_hints` raise it before dispatching, as `poll_completed` and
-`get_stats` do, and report nothing.
+`get_stats` do, and report nothing. A handler that surfaces it while
+dispatching (for example through the remote store's submit) does not turn it
+into `handler_error`: it propagates the same way.
 
 ### Parsing
 
 `parse_hints(envelope) -> (hints, rejections)`. A structurally
 invalid envelope (not a mapping or struct, `actions` not a list) raises
 `ValueError`, as today. Everything else is per hint and never raises: a
-non-mapping hint, an unknown `action_type`, a non-mapping payload, or a
-payload the type's parser refuses produces a `HintResult(REJECTED,
-reason)` and the loop continues. Protocol and hint version mismatches warn
-once per issue. An envelope whose hints are all rejected returns an empty
+non-mapping hint, a non-string `action_id`, an unknown `action_type`, a
+non-mapping payload, or a payload the type's parser refuses (`ValueError`
+reason, or `invalid_hint` for any other exception) produces a
+`HintResult(REJECTED, reason)` and the loop continues. Protocol and hint
+version mismatches warn once per issue, and rejections warn once per
+(registered type, reason), with all unregistered types sharing one entry. An envelope whose hints are all rejected returns an empty
 hint list and the rejections; it does not raise.
 
 ### Inline dispatch
@@ -136,8 +140,7 @@ shared and unchanged, and `core.py` is not touched.
   field or a dedicated action type): a key-adapter
   method to resolve router hashes to keys, prefetch layout, eviction flag,
   per-pool reservation budget, explicit-source remote pulls with a prefetch
-  timeout at both peers. A reference implementation exists on branch
-  `composable-hints-prefetch-wip`.
+  timeout at both peers.
 - `kv.invalidate`, `kv.evict`, priority or retention, `mode=move`,
   `no_retain`.
 - Side-band ingress (for example a ZMQ listener) feeding `submit_hints`.
