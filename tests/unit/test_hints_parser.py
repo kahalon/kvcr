@@ -120,6 +120,58 @@ def test_rejections_logged_once_per_type_and_reason(
     assert caplog.text.count("unsupported_action_type") == 1
 
 
+def test_rejection_dedupe_is_bounded_for_unregistered_types(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _LOGGED_HINT_ISSUES.clear()
+    hint = _HintEnvelope(
+        "0.1",
+        "m",
+        [_HintAction(str(i), f"kv.future_{i}", "1.0", {}) for i in range(100)],
+    )
+    with caplog.at_level(logging.WARNING):
+        _, rejected = parse_hints(hint)
+    # Every hint is still reported with its own type; only the log is shared.
+    assert [r.action_type for r in rejected] == [f"kv.future_{i}" for i in range(100)]
+    assert len(_LOGGED_HINT_ISSUES) == 1
+    assert caplog.text.count("unsupported_action_type") == 1
+
+
+@pytest.mark.parametrize("action_id", [None, 7, ["a"]])
+def test_non_string_action_id_is_rejected(action_id) -> None:
+    hint = _HintEnvelope(
+        "0.1",
+        "m",
+        [
+            _HintAction(action_id, "kv.fetch", "1.0", {}),
+            _fetch_hint("ok", "tcp://a:1", (1,)),
+        ],
+    )
+    hints, rejected = parse_hints(hint)
+    assert [h.action_id for h in hints] == ["ok"]
+    assert [(r.action_id, r.action_type, r.reason) for r in rejected] == [
+        (None, "unknown", "invalid_hint")
+    ]
+
+
+def test_parser_exception_rejects_only_its_hint(monkeypatch) -> None:
+    def parse(action_id, payload):
+        raise TypeError("parser bug")
+
+    monkeypatch.setitem(_HINT_PARSERS, "kv.broken", ("1.0", parse))
+    hint = _HintEnvelope(
+        "0.1",
+        "m",
+        [
+            _HintAction("x", "kv.broken", "1.0", {}),
+            _fetch_hint("ok", "tcp://a:1", (1,)),
+        ],
+    )
+    hints, rejected = parse_hints(hint)
+    assert [h.action_id for h in hints] == ["ok"]
+    assert [(r.action_id, r.reason) for r in rejected] == [("x", "invalid_hint")]
+
+
 @pytest.mark.parametrize(
     "fetch_payload",
     [

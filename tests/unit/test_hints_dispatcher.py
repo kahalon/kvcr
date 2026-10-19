@@ -159,15 +159,32 @@ def test_close_closes_handlers_once(monkeypatch):
     assert handler.close_calls == 1
 
 
-def test_handlers_close_even_when_close_raises(monkeypatch):
+def test_handlers_close_only_once_the_loop_is_quiescent(monkeypatch):
     kvcr, handler, _ = _stub_kvcr(monkeypatch)
     monkeypatch.setattr(kvcr._core, "is_quiescent", lambda: False)
     with pytest.raises(RuntimeError, match="not quiescent"):
         kvcr.close()
-    assert handler.close_calls == 1
+    # Native operations may still reference backend state, so handlers (which
+    # may own such state) stay open until quiescence is proven.
+    assert handler.close_calls == 0
     monkeypatch.undo()
     kvcr.close()
     assert handler.close_calls == 1
+
+
+def test_handler_close_failure_does_not_skip_backend_cleanup(monkeypatch):
+    kvcr, handler, _ = _stub_kvcr(monkeypatch)
+    cleaned: list[str] = []
+    monkeypatch.setattr(
+        kvcr._core._remote_fw_dram, "close_main", lambda: cleaned.append("remote")
+    )
+
+    def boom() -> None:
+        raise RuntimeError("close boom")
+
+    handler.close = boom
+    kvcr.close()  # the dispatcher isolates handler close errors
+    assert cleaned == ["remote"]
 
 
 def test_submit_handler_exception_is_isolated(monkeypatch, caplog):
@@ -203,6 +220,22 @@ def test_progress_failure_propagates_from_submit(monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         kvcr._core._hints_dispatcher.submit_hints([_StubHint("b")], "req")
     assert handler.submitted == []
+    assert results == []
+    kvcr._core._progress._failure = None
+
+
+def test_progress_failure_during_dispatch_is_not_a_handler_error(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch)
+
+    def fail_then_raise(hint, request_id, message_id) -> None:
+        # What the remote store does: the progress thread died, so its submit
+        # re-raises the stored failure through the handler.
+        kvcr._core._progress._failure = RuntimeError("boom")
+        kvcr._core._progress.raise_if_failed()
+
+    handler.submit = fail_then_raise
+    with pytest.raises(RuntimeError, match="boom"):
+        kvcr.submit_hint(_tests("a"), request_id="req")
     assert results == []
     kvcr._core._progress._failure = None
 
