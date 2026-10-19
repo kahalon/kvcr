@@ -59,8 +59,8 @@ the deferred lane, whose outcomes are asynchronous. A hint whose
 with the sentinel `action_type="unknown"`. A hint reaches a terminal status
 (`ACCEPTED` or `REJECTED`) at submit time; a handler that raises has its
 hints reported `REJECTED` with reason `handler_error`. A fatal KVCR failure
-(the progress thread failed) is not a hint result: `submit_hint` and
-`submit_hints` raise it before dispatching, as `poll_completed` and
+(the progress thread failed) is not a hint result: `submit_hint`
+raises it before dispatching, as `poll_completed` and
 `get_stats` do, and report nothing. A handler that surfaces it while
 dispatching (for example through the remote store's submit) does not turn it
 into `handler_error`: it propagates the same way.
@@ -125,7 +125,7 @@ implementing `submit`, both registered with `registry.register_hint_type`,
 telemetry labels, tests, and a config block of its own if it needs one. The
 module is imported in `hints/__init__.py` so that importing the package
 registers it.
-Envelope handling, isolation, results, and the side-band entry point are
+Envelope handling, isolation, and results are
 shared and unchanged, and `core.py` is not touched.
 
 ## Potential future work
@@ -144,6 +144,7 @@ shared and unchanged, and `core.py` is not touched.
   timeout at both peers.
 - `kv.invalidate`, `kv.evict`, priority or retention, `mode=move`,
   `no_retain`.
-- Side-band ingress (for example a ZMQ listener) feeding `submit_hints`.
+- Side-band ingress (for example a ZMQ listener) feeding the dispatcher
+  parsed hints that did not arrive in an envelope.
 - Priority between deferred hints and over engine pulls on the progress
   thread.
