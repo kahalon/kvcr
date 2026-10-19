@@ -12,7 +12,7 @@ importing any of its modules registers them.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import msgspec
@@ -93,36 +93,10 @@ class HintDispatcher:
         hints, rejected = parse_hints(envelope)
         for result in rejected:
             self.report(msgspec.structs.replace(result, request_id=request_id))
-        self.submit_hints(hints, request_id, hint_message_id(envelope))
-
-    def submit_hints(
-        self,
-        hints: Sequence[_Hint],
-        request_id: str | None = None,
-        message_id: str | None = None,
-    ) -> None:
-        """Dispatch parsed hints to their handlers, one at a time, in order.
-
-        This is also the side-band entry point for hints that did not arrive
-        in an envelope.
-        """
-        self._core._progress.raise_if_failed()
+        message_id = hint_message_id(envelope)
         for hint in hints:
-            action_type = type(hint).ACTION_TYPE
-            handler = self._handlers.get(action_type)
-            if handler is not None:
-                self._submit_to_handler(handler, hint, request_id, message_id)
-            else:
-                self.report(
-                    HintResult(
-                        action_id=hint.action_id,
-                        action_type=action_type,
-                        status=HintStatus.REJECTED,
-                        reason="unsupported_action_type",
-                        request_id=request_id,
-                        message_id=message_id,
-                    )
-                )
+            handler = self._handlers[type(hint).ACTION_TYPE]
+            self._submit_to_handler(handler, hint, request_id, message_id)
 
     def _submit_to_handler(
         self,
