@@ -268,9 +268,6 @@ class _KVCRCore:
         stats_factory = self._stats_factory if self.config.enable_telemetry else None
         telemetry_enabled = stats_factory is not None
         self._stats = stats_factory() if stats_factory is not None else None
-        # Hint handlers and results; which handlers exist is the dispatcher's
-        # registry, not core's business.
-        self._hints_dispatcher = HintDispatcher(self)
         self._timer: _Timer = time.monotonic if telemetry_enabled else _noop_timer
         self._record_duration: _RecordDuration = (
             self._record_duration_enabled
@@ -321,6 +318,10 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
+        # Hint handlers and results; which handlers exist is the dispatcher's
+        # registry, not core's business. Built after the backends so handlers
+        # can bind to them.
+        self._hints_dispatcher = HintDispatcher(self)
         kvcr_regions = (
             {region.label: region for region in self._local_dram.memory_regions}
             if self._local_dram is not None
@@ -715,9 +716,6 @@ class _KVCRCore:
     def close(self) -> None:
         if self._closed:
             return
-        # Hint handlers close first, before anything that can raise.
-        with self._state_lock:
-            self._hints_dispatcher.close()
         # Assumption: the framework drains submitted jobs before close.
         progress_error: BaseException | None = None
         try:
@@ -754,6 +752,10 @@ class _KVCRCore:
         if progress_error is not None:
             raise progress_error
 
+    def _close_hint_handlers(self) -> None:
+        with self._state_lock:
+            self._hints_dispatcher.close()
+
     def _close_main_resources(self) -> None:
         # Every stage runs even if an earlier one failed: skipping the rest
         # would leak files and pins for a failure that says nothing about them.
@@ -772,6 +774,7 @@ class _KVCRCore:
                         exc_info=True,
                     )
 
+        run(self._close_hint_handlers)
         if self._g3 is not None:
             run(self._g3.close_main)
         if self._local_dram is not None:

@@ -93,11 +93,14 @@ def reject_hint(
 
     Shared with hint handlers, which use it for their own rejections.
     """
-    issue = f"rejected:{action_type}:{reason}"
+    # The dedupe set is process-global, so key it on a bounded value: a type
+    # nothing registered is router-controlled input.
+    known_type = action_type if action_type in _HINT_PARSERS else "unknown"
+    issue = f"rejected:{known_type}:{reason}"
     if issue not in _LOGGED_HINT_ISSUES:
         _LOGGED_HINT_ISSUES.add(issue)
         logger.warning(
-            "KV hint hint rejected; action_type=%s reason=%s", action_type, reason
+            "KV hint rejected; action_type=%s reason=%s", action_type, reason
         )
     return HintResult(
         action_id=action_id,
@@ -149,7 +152,8 @@ def parse_hints(
 
         action_id = _hint_field(raw, "action_id")
         if not isinstance(action_id, str):
-            action_id = None
+            rejected.append(reject_hint(None, "unknown", "invalid_hint", message_id))
+            continue
         action_type = _hint_field(raw, "action_type")
         if not isinstance(action_type, str):
             rejected.append(
@@ -186,4 +190,9 @@ def parse_hints(
             hints.append(parse(action_id, payload))
         except ValueError as exc:
             rejected.append(reject_hint(action_id, action_type, str(exc), message_id))
+        except Exception:
+            # A parser must not take down the envelope's other hints.
+            rejected.append(
+                reject_hint(action_id, action_type, "invalid_hint", message_id)
+            )
     return hints, rejected

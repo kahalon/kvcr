@@ -83,8 +83,9 @@ class HintDispatcher:
     """Routes parsed hints to their handlers and reports their results.
 
     Core owns one dispatcher and calls ``submit`` from the caller's thread and
-    ``close`` under its state lock before anything that can raise. Which
-    handlers exist is decided here, by the registry, not by core.
+    ``close`` under its state lock once the progress loop is quiescent, with
+    the other main-thread resources. Which handlers exist is decided here, by
+    the registry, not by core.
     """
 
     def __init__(self, core: _KVCRCore) -> None:
@@ -147,10 +148,12 @@ class HintDispatcher:
     ) -> None:
         # Contract: a handler reports the hint exactly once, or raises before
         # doing so. Inline hints are terminal at submit time, so a raise
-        # means REJECTED.
+        # means REJECTED, unless the raise is the fatal progress-thread
+        # failure, which propagates to the caller as it does without hints.
         try:
             handler.submit(hint, request_id, message_id)
         except Exception:
+            self._core._progress.raise_if_failed()
             _warn_handler_error(handler.action_type, "submit")
             self.report(
                 HintResult(
