@@ -157,18 +157,6 @@ def test_submit_routes_to_handler_and_rejects_unregistered_types(monkeypatch):
     assert all((r.request_id, r.message_id) == ("req", "m1") for r in results)
 
 
-def test_submit_hints_rejects_a_hint_without_a_handler(monkeypatch):
-    kvcr, handler, results = _stub_kvcr(monkeypatch)
-    kvcr._core._hints_dispatcher.submit_hints(
-        [_StubHint("a"), _UnhandledHint("b")], "req", "m1"
-    )
-    assert handler.submitted == [_StubHint("a")]
-    assert [(r.action_id, r.status, r.reason) for r in results] == [
-        ("a", HintStatus.ACCEPTED, None),
-        ("b", HintStatus.REJECTED, "unsupported_action_type"),
-    ]
-
-
 def test_close_closes_handlers_once(monkeypatch):
     kvcr, handler, _ = _stub_kvcr(monkeypatch)
     kvcr.close()
@@ -243,7 +231,7 @@ def test_progress_failure_propagates_from_submit(monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         kvcr.submit_hint(_tests("a"), request_id="req")
     with pytest.raises(RuntimeError, match="boom"):
-        kvcr._core._hints_dispatcher.submit_hints([_StubHint("b")], "req")
+        kvcr._core._hints_dispatcher.submit(_tests("b"), "req")
     assert handler.submitted == []
     assert results == []
     kvcr._core._progress._failure = None
