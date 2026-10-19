@@ -19,12 +19,12 @@ from _kvcr_test_utils import (
 
 from kvcr.config import KVCRConfig
 from kvcr.hints.dispatcher import (
-    _HANDLER_FACTORIES,
     _LOGGED_HANDLER_ERRORS,
     HINTS_METRIC,
     HintDispatcher,
 )
-from kvcr.hints.parser import _HINT_PARSERS, _LOGGED_HINT_ISSUES
+from kvcr.hints.parser import _LOGGED_HINT_ISSUES
+from kvcr.hints.registry import _HINT_TYPES, HintType
 from kvcr.types import HintResult, HintStatus
 
 
@@ -92,18 +92,19 @@ def _tests(*ids: str) -> _HintEnvelope:
 
 
 def _stub_kvcr(monkeypatch, **config_fields):
-    monkeypatch.setitem(_HINT_PARSERS, "kv.test", ("1.0", lambda i, p: _StubHint(i)))
-    monkeypatch.setitem(
-        _HINT_PARSERS, "kv.unhandled", ("1.0", lambda i, p: _UnhandledHint(i))
-    )
     config = KVCRConfig(
         nixl_agent_name="target", pool_layouts=[("", 16)], **config_fields
     )
-    # Handlers come from the dispatcher's registry, instantiated per core.
+    # Handlers come from the registry, instantiated per core.
     monkeypatch.setitem(
-        _HANDLER_FACTORIES,
+        _HINT_TYPES,
         "kv.test",
-        lambda core, dispatcher: _StubHandler(core, dispatcher),
+        HintType(
+            "kv.test",
+            "1.0",
+            lambda i, p: _StubHint(i),
+            lambda core, dispatcher: _StubHandler(core, dispatcher),
+        ),
     )
     kvcr = _new_kvcr(
         FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl(), config=config
@@ -132,23 +133,40 @@ def test_dispatcher_owns_the_handler_registry(monkeypatch):
         built_for.append((core, dispatcher))
         return _StubHandler(core, dispatcher)
 
-    monkeypatch.setitem(_HANDLER_FACTORIES, "kv.test", factory)
+    monkeypatch.setitem(
+        _HINT_TYPES,
+        "kv.test",
+        HintType("kv.test", "1.0", lambda i, p: _StubHint(i), factory),
+    )
     dispatcher = HintDispatcher(kvcr._core)
     assert set(dispatcher._handlers) == {"kv.fetch", "kv.test"}
     assert built_for == [(kvcr._core, dispatcher)]
 
 
-def test_submit_hints_routes_to_handler_and_rejects_unknown(monkeypatch):
+def test_submit_routes_to_handler_and_rejects_unregistered_types(monkeypatch):
     kvcr, handler, results = _stub_kvcr(monkeypatch)
     kvcr.submit_hint(
         _envelope(("a", "kv.test"), ("b", "kv.unhandled")), request_id="req"
     )
     assert handler.submitted == [_StubHint("a")]
+    # The parser's rejections are reported before the dispatched hints.
     assert [(r.action_id, r.action_type, r.status, r.reason) for r in results] == [
-        ("a", "kv.test", HintStatus.ACCEPTED, None),
         ("b", "kv.unhandled", HintStatus.REJECTED, "unsupported_action_type"),
+        ("a", "kv.test", HintStatus.ACCEPTED, None),
     ]
     assert all((r.request_id, r.message_id) == ("req", "m1") for r in results)
+
+
+def test_submit_hints_rejects_a_hint_without_a_handler(monkeypatch):
+    kvcr, handler, results = _stub_kvcr(monkeypatch)
+    kvcr._core._hints_dispatcher.submit_hints(
+        [_StubHint("a"), _UnhandledHint("b")], "req", "m1"
+    )
+    assert handler.submitted == [_StubHint("a")]
+    assert [(r.action_id, r.status, r.reason) for r in results] == [
+        ("a", HintStatus.ACCEPTED, None),
+        ("b", HintStatus.REJECTED, "unsupported_action_type"),
+    ]
 
 
 def test_close_closes_handlers_once(monkeypatch):
@@ -206,6 +224,13 @@ def test_submit_handler_exception_is_isolated(monkeypatch, caplog):
     assert warnings[0].exc_info is not None
     results.clear()
 
+    monkeypatch.setitem(
+        _HINT_TYPES,
+        "kv.unhandled",
+        HintType(
+            "kv.unhandled", "1.0", lambda i, p: _UnhandledHint(i), lambda c, d: healthy
+        ),
+    )
     kvcr._core._hints_dispatcher._handlers["kv.unhandled"] = healthy
     kvcr.submit_hint(_envelope(("d", "kv.unhandled")))
     assert _take(results) == [("d", HintStatus.ACCEPTED, None)]

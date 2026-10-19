@@ -9,13 +9,13 @@ import pytest
 from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 
 from kvcr.hints.fetch import _KVFetchHint
-from kvcr.hints.parser import (
-    _HINT_PARSERS,
-    _LOGGED_HINT_ISSUES,
-    parse_hints,
-    register_hint_parser,
-)
+from kvcr.hints.parser import _LOGGED_HINT_ISSUES, parse_hints
+from kvcr.hints.registry import _HINT_TYPES, HintType, register_hint_type
 from kvcr.types import HintStatus
+
+
+def _no_handler(core, dispatcher):
+    raise AssertionError("parser tests build no handlers")
 
 
 def _fetch_hint(action_id, source, hashes, **extra) -> _HintAction:
@@ -158,7 +158,9 @@ def test_parser_exception_rejects_only_its_hint(monkeypatch) -> None:
     def parse(action_id, payload):
         raise TypeError("parser bug")
 
-    monkeypatch.setitem(_HINT_PARSERS, "kv.broken", ("1.0", parse))
+    monkeypatch.setitem(
+        _HINT_TYPES, "kv.broken", HintType("kv.broken", "1.0", parse, _no_handler)
+    )
     hint = _HintEnvelope(
         "0.1",
         "m",
@@ -214,7 +216,9 @@ def test_registered_action_type_is_parsed(monkeypatch):
             raise ValueError("missing n")
         return _Stub(action_id, payload["n"])
 
-    monkeypatch.setitem(_HINT_PARSERS, "kv.stub", ("1.0", parse))
+    monkeypatch.setitem(
+        _HINT_TYPES, "kv.stub", HintType("kv.stub", "1.0", parse, _no_handler)
+    )
     hint = _HintEnvelope(
         "0.1",
         "m",
@@ -228,7 +232,12 @@ def test_registered_action_type_is_parsed(monkeypatch):
     assert [(r.action_id, r.reason) for r in rejected] == [("t", "missing n")]
 
 
-def test_register_hint_parser_adds_entry(monkeypatch):
-    monkeypatch.setitem(_HINT_PARSERS, "kv.other", None)  # restored on teardown
-    register_hint_parser("kv.other", "2.0", lambda i, p: None)
-    assert _HINT_PARSERS["kv.other"][0] == "2.0"
+def test_register_hint_type_adds_parser_and_handler_together(monkeypatch):
+    monkeypatch.setitem(_HINT_TYPES, "kv.other", None)  # restored on teardown
+    parse = lambda i, p: None  # noqa: E731
+    register_hint_type("kv.other", "2.0", parse, _no_handler)
+    assert _HINT_TYPES["kv.other"] == HintType("kv.other", "2.0", parse, _no_handler)
+
+
+def test_builtin_fetch_type_is_registered_by_importing_the_package():
+    assert _HINT_TYPES["kv.fetch"].version == "1.0"
