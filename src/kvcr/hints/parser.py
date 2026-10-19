@@ -4,8 +4,8 @@
 """Parse KV hint envelopes into typed hints.
 
 Hints are advisory request metadata. This module validates versioned KV hint
-envelopes and parses every hint through a per-hint-type registry that the
-hint modules populate (``register_hint_parser``). Hints that cannot be used
+envelopes and parses every hint through the hint type registry that the
+hint modules populate (``registry.register_hint_type``). Hints that cannot be used
 are reported as ``REJECTED`` results instead of raising. Integration constants
 are exported by ``kvcr.__init__``.
 """
@@ -13,12 +13,13 @@ are exported by ``kvcr.__init__``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import ClassVar, Protocol
 
 import msgspec
 
 from ..types import HintResult, HintStatus
+from .registry import _HINT_TYPES
 
 # Public integration constants exported by kvcr.__init__.
 ROUTER_HINT_KEY = "kv_hint"
@@ -64,24 +65,6 @@ class _Hint(Protocol):
     def action_id(self) -> str | None: ...
 
 
-_HintParser = Callable[[str | None, Mapping[str, object]], _Hint]
-
-# action_type -> (supported action_version, payload parser).
-_HINT_PARSERS: dict[str, tuple[str, _HintParser]] = {}
-
-
-def register_hint_parser(
-    action_type: str, action_version: str, parse: _HintParser
-) -> None:
-    """Register the payload parser for ``action_type``.
-
-    ``parse(action_id, payload)`` returns the typed hint or raises
-    ``ValueError(reason)``, which becomes the hint's rejection reason. Hint
-    modules call this at import time, next to their handler registration.
-    """
-    _HINT_PARSERS[action_type] = (action_version, parse)
-
-
 def reject_hint(
     action_id: str | None,
     action_type: str,
@@ -95,7 +78,7 @@ def reject_hint(
     """
     # The dedupe set is process-global, so key it on a bounded value: a type
     # nothing registered is router-controlled input.
-    known_type = action_type if action_type in _HINT_PARSERS else "unknown"
+    known_type = action_type if action_type in _HINT_TYPES else "unknown"
     issue = f"rejected:{known_type}:{reason}"
     if issue not in _LOGGED_HINT_ISSUES:
         _LOGGED_HINT_ISSUES.add(issue)
@@ -160,8 +143,8 @@ def parse_hints(
                 reject_hint(action_id, "unknown", "invalid_hint", message_id)
             )
             continue
-        entry = _HINT_PARSERS.get(action_type)
-        if entry is None:
+        hint_type = _HINT_TYPES.get(action_type)
+        if hint_type is None:
             rejected.append(
                 reject_hint(
                     action_id, action_type, "unsupported_action_type", message_id
@@ -169,9 +152,8 @@ def parse_hints(
             )
             continue
 
-        version, parse = entry
         _warn_version_mismatch(
-            supported=version,
+            supported=hint_type.version,
             received=_hint_field(raw, "action_version"),
             issue=f"{action_type}-version-mismatch",
             message=(
@@ -187,7 +169,7 @@ def parse_hints(
             )
             continue
         try:
-            hints.append(parse(action_id, payload))
+            hints.append(hint_type.parse(action_id, payload))
         except ValueError as exc:
             rejected.append(reject_hint(action_id, action_type, str(exc), message_id))
         except Exception:

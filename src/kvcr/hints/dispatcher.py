@@ -4,21 +4,22 @@
 
 ``HintDispatcher`` owns the handler table and reports every hint's result
 as telemetry; core holds one dispatcher and delegates to it. Hint modules
-register their handler with ``register_hint_handler`` (and their parser
-with ``parser.register_hint_parser``); the built-in modules are imported at
-the bottom of this file so that importing the dispatcher registers them.
+register their parser and handler together with
+``registry.register_hint_type``; the package imports the built-in modules, so
+importing any of its modules registers them.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 import msgspec
 
 from ..types import HintResult, HintStatus
 from .parser import _Hint, hint_message_id, parse_hints
+from .registry import _HINT_TYPES
 
 if TYPE_CHECKING:
     from ..core import _KVCRCore
@@ -63,22 +64,6 @@ class _HintHandler(Protocol):
     def close(self) -> None: ...
 
 
-_HintHandlerFactory = Callable[["_KVCRCore", "HintDispatcher"], _HintHandler]
-
-# action_type -> handler factory. Hint modules register at import time; a
-# dispatcher instantiates every registered handler for its core.
-_HANDLER_FACTORIES: dict[str, _HintHandlerFactory] = {}
-
-
-def register_hint_handler(action_type: str, factory: _HintHandlerFactory) -> None:
-    """Register the handler for ``action_type``.
-
-    ``factory(core, dispatcher)`` builds it: ``core`` for backend access,
-    ``dispatcher`` to ``report`` results.
-    """
-    _HANDLER_FACTORIES[action_type] = factory
-
-
 class HintDispatcher:
     """Routes parsed hints to their handlers and reports their results.
 
@@ -91,8 +76,8 @@ class HintDispatcher:
     def __init__(self, core: _KVCRCore) -> None:
         self._core = core
         self._handlers: dict[str, _HintHandler] = {
-            action_type: factory(core, self)
-            for action_type, factory in _HANDLER_FACTORIES.items()
+            action_type: hint_type.handler_factory(core, self)
+            for action_type, hint_type in _HINT_TYPES.items()
         }
         self._closed = False
 
@@ -193,10 +178,3 @@ class HintDispatcher:
                 handler.close()
             except Exception:
                 _warn_handler_error(handler.action_type, "close")
-
-
-# Built-in hint modules. Importing them registers their parser and handler;
-# the import sits last so the protocol above is defined when they load.
-from .fetch import _FetchHintHandler  # noqa: E402
-
-register_hint_handler(_FetchHintHandler.action_type, _FetchHintHandler)

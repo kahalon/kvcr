@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, ClassVar
 import msgspec
 
 from ..types import HintResult, HintStatus
-from .parser import _Hint, register_hint_parser
+from .parser import _Hint
+from .registry import register_hint_type
 
 if TYPE_CHECKING:
     from ..core import _KVCRCore
@@ -70,9 +71,6 @@ def _parse_kv_fetch(
     return _KVFetchHint(action_id, source, frozenset(hashes))
 
 
-register_hint_parser(_KV_FETCH_ACTION_TYPE, _KV_FETCH_ACTION_VERSION, _parse_kv_fetch)
-
-
 class _FetchHintHandler:
     """Engine-destination ``kv.fetch``: stores the per-request remote hint."""
 
@@ -106,3 +104,11 @@ class _FetchHintHandler:
 
     def close(self) -> None:
         pass
+
+
+register_hint_type(
+    _KV_FETCH_ACTION_TYPE,
+    _KV_FETCH_ACTION_VERSION,
+    _parse_kv_fetch,
+    _FetchHintHandler,
+)
