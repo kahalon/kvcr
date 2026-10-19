@@ -25,11 +25,12 @@ rule that submitted does not mean ready.
 ### Hint model
 
 Each parsed hint is a frozen `msgspec.Struct` with at least `action_id:
-str | None` and a class-level `ACTION_TYPE: str`. Two registries live in the
-`kvcr.hints` package and are filled by the hint modules themselves at import
-time: `parser.register_hint_parser` maps `action_type` to
-`(supported_version, parse_payload)`, and `dispatcher.register_hint_handler`
-maps `action_type` to a handler factory called as `factory(core, dispatcher)`.
+str | None` and a class-level `ACTION_TYPE: str`. One registry lives in
+`kvcr.hints.registry` and is filled by the hint modules themselves at import
+time: `register_hint_type(action_type, version, parse_payload,
+handler_factory)`, with the handler factory called as `factory(core,
+dispatcher)`. The parser and the dispatcher both read it, so a type always
+has a parser and a handler.
 A `HintDispatcher` instantiates every registered handler for its core; a
 handler uses `core` for backend access and the dispatcher to `report`
 results. Core holds one dispatcher and never names a handler.
@@ -119,11 +120,11 @@ This change adds no configuration.
 ## Adding a hint type
 
 A new hint type is one module in `kvcr/hints/`: the
-parsed struct with its `ACTION_TYPE`, the payload parser registered with
-`parser.register_hint_parser`, a handler class implementing `submit`,
-registered with `dispatcher.register_hint_handler`, telemetry labels, tests,
-and a config block of its own if it needs one. The module is imported at the
-bottom of `dispatcher.py` so that importing the dispatcher registers it.
+parsed struct with its `ACTION_TYPE`, the payload parser, a handler class
+implementing `submit`, both registered with `registry.register_hint_type`,
+telemetry labels, tests, and a config block of its own if it needs one. The
+module is imported in `hints/__init__.py` so that importing the package
+registers it.
 Envelope handling, isolation, results, and the side-band entry point are
 shared and unchanged, and `core.py` is not touched.
 
