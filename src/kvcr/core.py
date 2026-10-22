@@ -318,9 +318,7 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
-        # Hint handlers and results; which handlers exist is the dispatcher's
-        # registry, not core's business. Built after the backends so handlers
-        # can bind to them.
+        # Built after the backends so hint handlers can bind to them.
         self._hints_dispatcher = HintDispatcher(self)
         kvcr_regions = (
             {region.label: region for region in self._local_dram.memory_regions}
