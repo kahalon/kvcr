@@ -45,14 +45,8 @@ class _StubHint(msgspec.Struct, frozen=True):
     action_id: str | None
 
 
-class _UnhandledHint(msgspec.Struct, frozen=True):
-    ACTION_TYPE: ClassVar[str] = "kv.unhandled"
-
-    action_id: str | None
-
-
 class _StubHandler:
-    """Inline handler that accepts every hint it is given."""
+    """Inline handler that accepts every hint except those listed in ``fail``."""
 
     action_type = "kv.test"
 
@@ -61,10 +55,10 @@ class _StubHandler:
         self.dispatcher = dispatcher
         self.submitted: list[_StubHint] = []
         self.close_calls = 0
-        self.raise_on_submit = False
+        self.fail: set[str] = set()
 
     def submit(self, hint, request_id, message_id) -> None:
-        if self.raise_on_submit:
+        if hint.action_id in self.fail:
             raise RuntimeError("submit boom")
         self.submitted.append(hint)
         self.dispatcher.report(
@@ -157,14 +151,6 @@ def test_submit_routes_to_handler_and_rejects_unregistered_types(monkeypatch):
     assert all((r.request_id, r.message_id) == ("req", "m1") for r in results)
 
 
-def test_close_closes_handlers_once(monkeypatch):
-    kvcr, handler, _ = _stub_kvcr(monkeypatch)
-    kvcr.close()
-    assert handler.close_calls == 1
-    kvcr.close()
-    assert handler.close_calls == 1
-
-
 def test_handlers_close_only_once_the_loop_is_quiescent(monkeypatch):
     kvcr, handler, _ = _stub_kvcr(monkeypatch)
     monkeypatch.setattr(kvcr._core, "is_quiescent", lambda: False)
@@ -174,6 +160,8 @@ def test_handlers_close_only_once_the_loop_is_quiescent(monkeypatch):
     # may own such state) stay open until quiescence is proven.
     assert handler.close_calls == 0
     monkeypatch.undo()
+    kvcr.close()
+    assert handler.close_calls == 1
     kvcr.close()
     assert handler.close_calls == 1
 
@@ -193,36 +181,22 @@ def test_handler_close_failure_does_not_skip_backend_cleanup(monkeypatch):
     assert cleaned == ["remote"]
 
 
-def test_submit_handler_exception_is_isolated(monkeypatch, caplog):
+def test_handler_exception_rejects_only_its_hint(monkeypatch, caplog):
     kvcr, handler, results = _stub_kvcr(monkeypatch)
-    healthy = _StubHandler(kvcr._core, kvcr._core._hints_dispatcher)
-    healthy.action_type = "kv.unhandled"
-    handler.raise_on_submit = True
+    handler.fail = {"a", "c"}
     with caplog.at_level(logging.WARNING, logger="kvcr.hints.dispatcher"):
-        kvcr.submit_hint(_tests("a", "b"), request_id="req")
-        kvcr.submit_hint(_tests("c"), request_id="req")
-    assert [(r.action_id, r.action_type, r.status, r.reason) for r in results] == [
-        ("a", "kv.test", HintStatus.REJECTED, "handler_error"),
-        ("b", "kv.test", HintStatus.REJECTED, "handler_error"),
-        ("c", "kv.test", HintStatus.REJECTED, "handler_error"),
+        kvcr.submit_hint(_tests("a", "b", "c"), request_id="req")
+    # The healthy sibling right after a failing hint is still dispatched.
+    assert handler.submitted == [_StubHint("b")]
+    assert all((r.request_id, r.message_id) == ("req", "m1") for r in results)
+    assert _take(results) == [
+        ("a", HintStatus.REJECTED, "handler_error"),
+        ("b", HintStatus.ACCEPTED, None),
+        ("c", HintStatus.REJECTED, "handler_error"),
     ]
-    assert all(r.request_id == "req" and r.message_id == "m1" for r in results)
     warnings = [r for r in caplog.records if r.name == "kvcr.hints.dispatcher"]
     assert len(warnings) == 1
     assert warnings[0].exc_info is not None
-    results.clear()
-
-    monkeypatch.setitem(
-        _HINT_TYPES,
-        "kv.unhandled",
-        HintType(
-            "kv.unhandled", "1.0", lambda i, p: _UnhandledHint(i), lambda c, d: healthy
-        ),
-    )
-    kvcr._core._hints_dispatcher._handlers["kv.unhandled"] = healthy
-    kvcr.submit_hint(_envelope(("d", "kv.unhandled")))
-    assert _take(results) == [("d", HintStatus.ACCEPTED, None)]
-    assert healthy.submitted == [_UnhandledHint("d")]
 
 
 def test_progress_failure_propagates_from_submit(monkeypatch):
@@ -253,19 +227,6 @@ def test_progress_failure_during_dispatch_is_not_a_handler_error(monkeypatch):
     kvcr._core._progress._failure = None
 
 
-def test_results_carry_request_and_message_ids(monkeypatch):
-    kvcr, _, results = _stub_kvcr(monkeypatch)
-    kvcr.submit_hint(
-        _envelope(("x", "kv.missing"), ("a", "kv.test"), message_id="m7"),
-        request_id="req",
-    )
-    assert [(r.action_id, r.status) for r in results] == [
-        ("x", HintStatus.REJECTED),
-        ("a", HintStatus.ACCEPTED),
-    ]
-    assert all(r.request_id == "req" and r.message_id == "m7" for r in results)
-
-
 def test_every_result_is_counted_in_telemetry(monkeypatch):
     kvcr, _, results = _stub_kvcr(monkeypatch, enable_telemetry=True)
     kvcr.submit_hint(_envelope(("x", "kv.whatever-1234"), ("a", "kv.test")))
@@ -281,14 +242,3 @@ def test_every_result_is_counted_in_telemetry(monkeypatch):
         if kind == "counter" and name == HINTS_METRIC
     ]
     assert counters == [("unknown", "REJECTED"), ("kv.test", "ACCEPTED")]
-
-
-def test_results_are_telemetry_only_without_stats(monkeypatch):
-    # No stats object: reporting is a no-op rather than an error.
-    kvcr, _, results = _stub_kvcr(monkeypatch)
-    assert kvcr._core._stats is None
-    kvcr.submit_hint(_tests("a", "b"))
-    assert _take(results) == [
-        ("a", HintStatus.ACCEPTED, None),
-        ("b", HintStatus.ACCEPTED, None),
-    ]

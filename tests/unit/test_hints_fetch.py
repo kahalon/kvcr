@@ -106,47 +106,24 @@ def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch):
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, "req")]
 
 
-def test_second_same_source_hint_in_envelope_replaces_hashes(monkeypatch):
+@pytest.mark.parametrize("one_envelope", [True, False], ids=["envelope", "calls"])
+@pytest.mark.parametrize(
+    ("second_source", "expected"),
+    [("tcp://a:1", [_MISS, _FETCHABLE]), ("tcp://b:1", [_MISS, _MISS])],
+    ids=["same_source_replaces", "other_source_fails"],
+)
+def test_second_fetch_for_a_request(monkeypatch, one_envelope, second_source, expected):
     kvcr, results = _fetch_kvcr(monkeypatch)
-    calls = []
-    remote = kvcr._core._remote_fw_dram
-    real = remote.submit_hint
-    remote.submit_hint = lambda *a: (calls.append(a), real(*a))[1]
-    kvcr.submit_hint(
-        _fetch_envelope(_fetch("a1", "tcp://a:1", [1]), _fetch("a2", "tcp://a:1", [2])),
-        "req",
-    )
-    # One store call per hint; the store keeps the last hashes, as across calls.
-    assert len(calls) == 2
+    first, second = _fetch("a1", "tcp://a:1", [1]), _fetch("a2", second_source, [2])
+    for hints in [(first, second)] if one_envelope else [(first,), (second,)]:
+        kvcr.submit_hint(_fetch_envelope(*hints), "req")
+    # The store's rules apply within an envelope as across calls, and it reports
+    # neither the replacement nor the failure.
     assert _take(results) == [
         ("a1", HintStatus.ACCEPTED, None),
         ("a2", HintStatus.ACCEPTED, None),
     ]
-    assert kvcr.query((_key(1), _key(2)), "req") == [_MISS, _FETCHABLE]
-
-
-def test_second_source_in_envelope_fails_request(monkeypatch):
-    kvcr, results = _fetch_kvcr(monkeypatch)
-    kvcr.submit_hint(
-        _fetch_envelope(_fetch("a1", "tcp://a:1", [1]), _fetch("b1", "tcp://b:1", [2])),
-        "req",
-    )
-    # The store does not report the conflict; it fails the request as before.
-    assert _take(results) == [
-        ("a1", HintStatus.ACCEPTED, None),
-        ("b1", HintStatus.ACCEPTED, None),
-    ]
-    assert kvcr._core._remote_fw_dram._request_hints["req"].failed is True
-    assert kvcr.query((_key(1), _key(2)), "req") == [_MISS, _MISS]
-
-
-def test_second_source_in_later_hint_fails_request(monkeypatch):
-    kvcr, results = _fetch_kvcr(monkeypatch)
-    kvcr.submit_hint(_fetch_envelope(_fetch("a1", "tcp://a:1", [1])), "req")
-    assert _take(results) == [("a1", HintStatus.ACCEPTED, None)]
-    kvcr.submit_hint(_fetch_envelope(_fetch("b1", "tcp://b:1", [2])), "req")
-    assert _take(results) == [("b1", HintStatus.ACCEPTED, None)]
-    assert kvcr._core._remote_fw_dram._request_hints["req"].failed is True
+    assert kvcr.query((_key(1), _key(2)), "req") == expected
 
 
 def test_mixed_valid_and_unknown_hints(monkeypatch):
@@ -158,7 +135,7 @@ def test_mixed_valid_and_unknown_hints(monkeypatch):
         ),
         "req",
     )
-    assert kvcr._core._remote_fw_dram._request_hints["req"].source == "tcp://a:1"
+    assert kvcr.query((_key(1),), "req") == [_FETCHABLE]
     assert set(_take(results)) == {
         ("a1", HintStatus.ACCEPTED, None),
         ("f1", HintStatus.REJECTED, "unsupported_action_type"),

@@ -629,9 +629,7 @@ def test_get_stats_emits_public_state_metric_name(monkeypatch) -> None:
     stats = kvcr.get_stats()
 
     assert isinstance(stats, FakeTelemetryStats)
-    assert {record[1] for record in stats.records} == {
-        "kvcr_state",
-    }
+    assert {record[1] for record in stats.records} == {"kvcr_state"}
     assert core._stats is not stats
 
 

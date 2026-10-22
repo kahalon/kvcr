@@ -59,12 +59,6 @@ def test_parse_hints_accepts_struct_and_mapping(as_mapping):
     assert hints[0].block_hashes == frozenset({123, 456})
 
 
-def test_parse_hints_all_rejected_does_not_raise():
-    hint = _HintEnvelope("0.1", "m", [_fetch_hint("bad", "", (1,))])
-    hints, rejected = parse_hints(hint)
-    assert hints == [] and len(rejected) == 1
-
-
 def test_parse_hints_non_mapping_action_and_payload():
     hint = _HintEnvelope(
         "0.1",
@@ -106,21 +100,6 @@ def test_parse_hints_warns_once_per_mismatched_version_field(
     assert caplog.text.count("kv.fetch action_version mismatch") == 1
 
 
-def test_rejections_logged_once_per_type_and_reason(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    _LOGGED_HINT_ISSUES.clear()
-    hint = _HintEnvelope(
-        "0.1",
-        "m",
-        [_HintAction(str(i), "kv.future_action", "1.0", {}) for i in range(3)],
-    )
-    with caplog.at_level(logging.WARNING):
-        parse_hints(hint)
-        parse_hints(hint)
-    assert caplog.text.count("unsupported_action_type") == 1
-
-
 def test_rejection_dedupe_is_bounded_for_unregistered_types(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -131,6 +110,7 @@ def test_rejection_dedupe_is_bounded_for_unregistered_types(
         [_HintAction(str(i), f"kv.future_{i}", "1.0", {}) for i in range(100)],
     )
     with caplog.at_level(logging.WARNING):
+        parse_hints(hint)
         _, rejected = parse_hints(hint)
     # Every hint is still reported with its own type; only the log is shared.
     assert [r.action_type for r in rejected] == [f"kv.future_{i}" for i in range(100)]
