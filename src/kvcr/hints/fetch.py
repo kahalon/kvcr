@@ -14,8 +14,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import msgspec
 
-from .parser import _Hint
-from .registry import register_hint_type
+from .parser import HintType, _Hint
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
@@ -106,7 +105,7 @@ class _FetchHintHandler:
         pass
 
 
-register_hint_type(
+KV_FETCH = HintType(
     _KV_FETCH_ACTION_TYPE,
     _KV_FETCH_ACTION_VERSION,
     _parse_kv_fetch,

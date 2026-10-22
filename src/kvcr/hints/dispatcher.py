@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Hint dispatch infrastructure.
 
-``HintDispatcher`` owns the handler table and reports every hint's result
-as telemetry; core holds one dispatcher and delegates to it. Hint modules
-register their parser and handler together with
-``registry.register_hint_type``; the package imports the built-in modules, so
-importing any of its modules registers them.
+``HintDispatcher`` owns the hint type table and reports every hint's result
+as telemetry; core holds one dispatcher and delegates to it. Each hint module
+defines a ``HintType`` (its parser and handler); ``_HINT_TYPES`` lists the
+supported ones.
 """
 
 from __future__ import annotations
@@ -17,14 +16,17 @@ from typing import TYPE_CHECKING, Protocol
 
 import msgspec
 
-from .parser import _Hint, hint_message_id, parse_hints
-from .registry import _HINT_TYPES
+from .fetch import KV_FETCH
+from .parser import HintType, _Hint, hint_message_id, parse_hints
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
     from ..core import _KVCRCore
 
 HINTS_METRIC = "kvcr_hints"
+
+# The supported hint types. Every dispatcher builds one handler per entry.
+_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH,)
 
 logger = logging.getLogger(__name__)
 # Handlers run on hot paths; warn once per (phase, action type) about errors.
@@ -69,15 +71,16 @@ class HintDispatcher:
 
     Core owns one dispatcher and calls ``submit`` from the caller's thread and
     ``close`` under its state lock once the progress loop is quiescent, with
-    the other main-thread resources. Which handlers exist is decided here, by
-    the registry, not by core.
+    the other main-thread resources. Which hint types exist is decided here,
+    by ``_HINT_TYPES``, not by core.
     """
 
     def __init__(self, core: _KVCRCore) -> None:
         self._core = core
+        self._types = {hint_type.action_type: hint_type for hint_type in _HINT_TYPES}
         self._handlers: dict[str, _HintHandler] = {
             action_type: hint_type.handler_factory(core, self)
-            for action_type, hint_type in _HINT_TYPES.items()
+            for action_type, hint_type in self._types.items()
         }
         self._closed = False
 
@@ -90,7 +93,7 @@ class HintDispatcher:
     ) -> None:
         """Parse an envelope, report its rejections, dispatch its hints."""
         self._core._progress.raise_if_failed()
-        hints, rejected = parse_hints(envelope)
+        hints, rejected = parse_hints(envelope, self._types)
         for result in rejected:
             self.report(msgspec.structs.replace(result, request_id=request_id))
         message_id = hint_message_id(envelope)
@@ -129,7 +132,7 @@ class HintDispatcher:
         """Record a hint's result; called by handlers and by the dispatcher.
 
         Results are telemetry only. The metric's ``action_type`` label is
-        bounded by the registered handlers; any other type is counted as
+        bounded by the dispatcher's handlers; any other type is counted as
         ``"unknown"`` (the result itself keeps the original string).
         """
         stats = self._core._stats

@@ -4,13 +4,12 @@
 
 ``parser`` turns a router envelope into typed hints, ``dispatcher`` routes each
 hint to its handler, and one module per hint type (``fetch`` today)
-implements the parser and the handler and registers both with
-``registry.register_hint_type`` at import time. Core holds one
-``HintDispatcher`` and never names a handler; adding a hint type is adding a
-module here and importing it below.
+implements the parser and the handler and ties them together in a
+``HintType``. Core holds one ``HintDispatcher`` and never names a handler;
+adding a hint type is adding a module here and listing its ``HintType`` in
+the dispatcher's ``_HINT_TYPES``.
 """
 
-from . import fetch  # noqa: F401  (registers the built-in hint types)
 from .parser import ROUTER_HINT_CAPABILITIES, ROUTER_HINT_KEY
 
 __all__ = ["ROUTER_HINT_CAPABILITIES", "ROUTER_HINT_KEY"]

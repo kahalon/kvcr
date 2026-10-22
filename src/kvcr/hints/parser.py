@@ -4,22 +4,26 @@
 """Parse KV hint envelopes into typed hints.
 
 Hints are advisory request metadata. This module validates versioned KV hint
-envelopes and parses every hint through the hint type registry that the
-hint modules populate (``registry.register_hint_type``). Hints that cannot be used
-are reported as ``REJECTED`` results instead of raising. Integration constants
-are exported by ``kvcr.__init__``.
+envelopes and parses every hint with the ``HintType`` the caller supplies for
+its ``action_type``. Hints that cannot be used are reported as ``REJECTED``
+results instead of raising. Integration constants are exported by
+``kvcr.__init__``.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
-from typing import ClassVar, Protocol
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import msgspec
 
-from .registry import _HINT_TYPES
 from .results import HintResult, HintStatus
+
+if TYPE_CHECKING:
+    from ..core import _KVCRCore
+    from .dispatcher import HintDispatcher, _HintHandler
 
 # Public integration constants exported by kvcr.__init__.
 ROUTER_HINT_KEY = "kv_hint"
@@ -56,7 +60,7 @@ class _Hint(Protocol):
     """A parsed envelope hint: a frozen struct per action type.
 
     ``ACTION_TYPE`` is the wire ``action_type`` the struct was parsed from and
-    the key under which its handler is registered.
+    the key of its handler in the dispatcher.
     """
 
     ACTION_TYPE: ClassVar[str]
@@ -65,21 +69,43 @@ class _Hint(Protocol):
     def action_id(self) -> str | None: ...
 
 
+_HintParser = Callable[[str | None, Mapping[str, object]], _Hint]
+_HintHandlerFactory = Callable[["_KVCRCore", "HintDispatcher"], "_HintHandler"]
+
+
+@dataclass(frozen=True)
+class HintType:
+    """One supported hint type: how its payload is parsed and who handles it.
+
+    ``version`` is the ``action_version`` the parser understands.
+    ``parse(action_id, payload)`` returns the typed hint or raises
+    ``ValueError(reason)``, which becomes the hint's rejection reason.
+    ``handler_factory(core, dispatcher)`` builds the handler: ``core`` for
+    backend access, ``dispatcher`` to ``report`` results.
+    """
+
+    action_type: str
+    version: str
+    parse: _HintParser
+    handler_factory: _HintHandlerFactory
+
+
 def reject_hint(
     action_id: str | None,
     action_type: str,
     reason: str,
     message_id: str | None,
     request_id: str | None = None,
+    *,
+    supported: bool = True,
 ) -> HintResult:
     """Build a ``REJECTED`` result and warn once per (action type, reason).
 
     Shared with hint handlers, which use it for their own rejections.
     """
     # The dedupe set is process-global, so key it on a bounded value: a type
-    # nothing registered is router-controlled input.
-    known_type = action_type if action_type in _HINT_TYPES else "unknown"
-    issue = f"rejected:{known_type}:{reason}"
+    # with no ``HintType`` is router-controlled input.
+    issue = f"rejected:{action_type if supported else 'unknown'}:{reason}"
     if issue not in _LOGGED_HINT_ISSUES:
         _LOGGED_HINT_ISSUES.add(issue)
         logger.warning(
@@ -103,8 +129,9 @@ def hint_message_id(hint: Mapping[str, object] | msgspec.Struct) -> str | None:
 
 def parse_hints(
     hint: Mapping[str, object] | msgspec.Struct,
+    types: Mapping[str, HintType],
 ) -> tuple[list[_Hint], list[HintResult]]:
-    """Parse every hint of a KV hint envelope.
+    """Parse every hint of a KV hint envelope with ``types`` (by action type).
 
     Returns the valid hints in envelope order and a ``REJECTED`` result for
     each hint that could not be used. Raises ``ValueError`` only when the
@@ -143,11 +170,15 @@ def parse_hints(
                 reject_hint(action_id, "unknown", "invalid_hint", message_id)
             )
             continue
-        hint_type = _HINT_TYPES.get(action_type)
+        hint_type = types.get(action_type)
         if hint_type is None:
             rejected.append(
                 reject_hint(
-                    action_id, action_type, "unsupported_action_type", message_id
+                    action_id,
+                    action_type,
+                    "unsupported_action_type",
+                    message_id,
+                    supported=False,
                 )
             )
             continue

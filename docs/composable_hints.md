@@ -25,15 +25,14 @@ rule that submitted does not mean ready.
 ### Hint model
 
 Each parsed hint is a frozen `msgspec.Struct` with at least `action_id:
-str | None` and a class-level `ACTION_TYPE: str`. One registry lives in
-`kvcr.hints.registry` and is filled by the hint modules themselves at import
-time: `register_hint_type(action_type, version, parse_payload,
-handler_factory)`, with the handler factory called as `factory(core,
-dispatcher)`. The parser and the dispatcher both read it, so a type always
-has a parser and a handler.
-A `HintDispatcher` instantiates every registered handler for its core; a
-handler uses `core` for backend access and the dispatcher to `report`
-results. Core holds one dispatcher and never names a handler.
+str | None` and a class-level `ACTION_TYPE: str`. Each hint module defines a
+`HintType(action_type, version, parse, handler_factory)`, and a fixed table
+in the dispatcher, `_HINT_TYPES`, lists the supported types. A
+`HintDispatcher` builds one handler per entry as `handler_factory(core,
+dispatcher)` and passes the same table to the parser, so a type always has a
+parser and a handler. A handler uses `core` for backend access and the
+dispatcher to `report` results. Core holds one dispatcher and never names a
+handler.
 
 ### Results
 
@@ -75,7 +74,7 @@ non-mapping payload, or a payload the type's parser refuses (`ValueError`
 reason, or `invalid_hint` for any other exception) produces a
 `HintResult(REJECTED, reason)` and the loop continues. Protocol and hint
 version mismatches warn once per issue, and rejections warn once per
-(registered type, reason), with all unregistered types sharing one entry. An envelope whose hints are all rejected returns an empty
+(supported type, reason), with all unsupported types sharing one entry. An envelope whose hints are all rejected returns an empty
 hint list and the rejections; it does not raise.
 
 ### Inline dispatch
@@ -88,7 +87,7 @@ handler exception is caught, logged once, and reported `REJECTED` with reason
 
 ### `kv.fetch`
 
-Module `hints/fetch.py`, the only registered hint type today; it stores
+Module `hints/fetch.py`, the only supported hint type today; it stores
 the per-request remote hint that the engine later turns into `fetch` and
 `deliver` calls.
 
@@ -114,17 +113,16 @@ This change adds no configuration.
 
 - `kvcr_hints` counter, labels `(action_type, status)` with the
   `HintStatus` value, incremented on every reported result. An
-  `action_type` with no registered handler is labelled `unknown` to keep the
+  `action_type` with no handler is labelled `unknown` to keep the
   label set bounded; the `HintResult` keeps the original string.
 
 ## Adding a hint type
 
 A new hint type is one module in `kvcr/hints/`: the
 parsed struct with its `ACTION_TYPE`, the payload parser, a handler class
-implementing `submit`, both registered with `registry.register_hint_type`,
-telemetry labels, tests, and a config block of its own if it needs one. The
-module is imported in `hints/__init__.py` so that importing the package
-registers it.
+implementing `submit`, the `HintType` that ties them together, telemetry
+labels, tests, and a config block of its own if it needs one. Its
+`HintType` is added to `_HINT_TYPES` in `hints/dispatcher.py`.
 Envelope handling, isolation, and results are
 shared and unchanged, and `core.py` is not touched.
 

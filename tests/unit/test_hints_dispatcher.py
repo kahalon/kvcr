@@ -19,12 +19,12 @@ from _kvcr_test_utils import (
 
 from kvcr.config import KVCRConfig
 from kvcr.hints.dispatcher import (
+    _HINT_TYPES,
     _LOGGED_HANDLER_ERRORS,
     HINTS_METRIC,
     HintDispatcher,
 )
-from kvcr.hints.parser import _LOGGED_HINT_ISSUES
-from kvcr.hints.registry import _HINT_TYPES, HintType
+from kvcr.hints.parser import _LOGGED_HINT_ISSUES, HintType
 from kvcr.hints.results import HintResult, HintStatus
 
 
@@ -75,6 +75,9 @@ class _StubHandler:
         self.close_calls += 1
 
 
+_STUB_TYPE = HintType("kv.test", "1.0", lambda i, p: _StubHint(i), _StubHandler)
+
+
 def _envelope(*hints: tuple[str, str], message_id: str = "m1") -> _HintEnvelope:
     return _HintEnvelope(
         "0.1", message_id, [_HintAction(i, t, "1.0", {}) for i, t in hints]
@@ -89,17 +92,8 @@ def _stub_kvcr(monkeypatch, **config_fields):
     config = KVCRConfig(
         nixl_agent_name="target", pool_layouts=[("", 16)], **config_fields
     )
-    # Handlers come from the registry, instantiated per core.
-    monkeypatch.setitem(
-        _HINT_TYPES,
-        "kv.test",
-        HintType(
-            "kv.test",
-            "1.0",
-            lambda i, p: _StubHint(i),
-            lambda core, dispatcher: _StubHandler(core, dispatcher),
-        ),
-    )
+    # Handlers come from the hint type table, instantiated per core.
+    monkeypatch.setattr("kvcr.hints.dispatcher._HINT_TYPES", (*_HINT_TYPES, _STUB_TYPE))
     kvcr = _new_kvcr(
         FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl(), config=config
     )
@@ -114,10 +108,10 @@ def _take(results) -> list[tuple[str | None, HintStatus, str | None]]:
     return taken
 
 
-def test_dispatcher_owns_the_handler_registry(monkeypatch):
-    # Core registers nothing itself: the built-in handler comes from the
-    # dispatcher module, and a newly registered factory appears in a fresh
-    # dispatcher without any core change.
+def test_dispatcher_owns_the_hint_type_table(monkeypatch):
+    # Core names no handler: the built-in handler comes from the dispatcher's
+    # table, and a type added to the table appears in a fresh dispatcher
+    # without any core change.
     kvcr = _new_kvcr(FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl())
     assert set(kvcr._core._hints_dispatcher._handlers) == {"kv.fetch"}
 
@@ -127,10 +121,9 @@ def test_dispatcher_owns_the_handler_registry(monkeypatch):
         built_for.append((core, dispatcher))
         return _StubHandler(core, dispatcher)
 
-    monkeypatch.setitem(
-        _HINT_TYPES,
-        "kv.test",
-        HintType("kv.test", "1.0", lambda i, p: _StubHint(i), factory),
+    monkeypatch.setattr(
+        "kvcr.hints.dispatcher._HINT_TYPES",
+        (*_HINT_TYPES, HintType("kv.test", "1.0", lambda i, p: _StubHint(i), factory)),
     )
     dispatcher = HintDispatcher(kvcr._core)
     assert set(dispatcher._handlers) == {"kv.fetch", "kv.test"}
@@ -231,7 +224,7 @@ def test_every_result_is_counted_in_telemetry(monkeypatch):
     kvcr, _, results = _stub_kvcr(monkeypatch, enable_telemetry=True)
     kvcr.submit_hint(_envelope(("x", "kv.whatever-1234"), ("a", "kv.test")))
     # The result keeps the original type; the metric label is bounded to the
-    # registered handlers, so an unknown type is counted as "unknown".
+    # dispatcher's handlers, so an unknown type is counted as "unknown".
     assert [(r.action_type, r.status) for r in results] == [
         ("kv.whatever-1234", HintStatus.REJECTED),
         ("kv.test", HintStatus.ACCEPTED),
