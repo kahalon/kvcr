@@ -14,9 +14,9 @@ from typing import TYPE_CHECKING, ClassVar
 
 import msgspec
 
-from ..types import HintResult, HintStatus
 from .parser import _Hint
 from .registry import register_hint_type
+from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
     from ..core import _KVCRCore

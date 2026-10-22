@@ -18,8 +18,8 @@ from typing import ClassVar, Protocol
 
 import msgspec
 
-from ..types import HintResult, HintStatus
 from .registry import _HINT_TYPES
+from .results import HintResult, HintStatus
 
 # Public integration constants exported by kvcr.__init__.
 ROUTER_HINT_KEY = "kv_hint"

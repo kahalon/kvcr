@@ -25,7 +25,7 @@ from kvcr.hints.dispatcher import (
 )
 from kvcr.hints.parser import _LOGGED_HINT_ISSUES
 from kvcr.hints.registry import _HINT_TYPES, HintType
-from kvcr.types import HintResult, HintStatus
+from kvcr.hints.results import HintResult, HintStatus
 
 
 @pytest.fixture(autouse=True)

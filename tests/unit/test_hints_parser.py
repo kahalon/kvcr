@@ -11,7 +11,7 @@ from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 from kvcr.hints.fetch import _KVFetchHint
 from kvcr.hints.parser import _LOGGED_HINT_ISSUES, parse_hints
 from kvcr.hints.registry import _HINT_TYPES, HintType, register_hint_type
-from kvcr.types import HintStatus
+from kvcr.hints.results import HintStatus
 
 
 def _no_handler(core, dispatcher):

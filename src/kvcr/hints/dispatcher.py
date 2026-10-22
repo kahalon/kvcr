@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING, Protocol
 
 import msgspec
 
-from ..types import HintResult, HintStatus
 from .parser import _Hint, hint_message_id, parse_hints
 from .registry import _HINT_TYPES
+from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
     from ..core import _KVCRCore

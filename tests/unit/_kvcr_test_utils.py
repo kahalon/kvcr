@@ -25,12 +25,12 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
+from kvcr.hints.results import HintResult
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy
 from kvcr.types import (
     BlockKey,
-    HintResult,
     MemoryRef,
     OpEntryResult,
     OpEntryStatus,

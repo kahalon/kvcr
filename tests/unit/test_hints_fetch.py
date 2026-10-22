@@ -17,7 +17,8 @@ from _kvcr_test_utils import (
 from kvcr.config import KVCRConfig, RemoteFWDramOptions
 from kvcr.hints.dispatcher import _LOGGED_HANDLER_ERRORS
 from kvcr.hints.parser import _LOGGED_HINT_ISSUES
-from kvcr.types import BlockKey, CacheTier, HintStatus, QueryStatus
+from kvcr.hints.results import HintStatus
+from kvcr.types import BlockKey, CacheTier, QueryStatus
 
 
 @pytest.fixture(autouse=True)
