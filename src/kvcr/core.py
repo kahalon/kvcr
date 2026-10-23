@@ -747,6 +747,7 @@ class _KVCRCore:
                 if self._local_dram is not None:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
+                self._hints_dispatcher.admit(self._clock())
         completed = self._completion_queue
         self._completion_queue = []
         return completed
@@ -796,6 +797,8 @@ class _KVCRCore:
     def close(self) -> None:
         if self._closed:
             return
+        with self._state_lock:
+            self._hints_dispatcher.close_queue()
         # Assumption: the framework drains submitted jobs before close.
         progress_error: BaseException | None = None
         try:
