@@ -81,7 +81,7 @@ class HintType:
     ``parse(action_id, payload)`` returns the typed hint or raises
     ``ValueError(reason)``, which becomes the hint's rejection reason.
     ``handler_factory(core, dispatcher)`` builds the handler: ``core`` for
-    backend access, ``dispatcher`` to ``report`` results.
+    backend access, ``dispatcher`` to ``report`` results and ``defer`` hints.
     """
 
     action_type: str

@@ -8,9 +8,14 @@ import msgspec
 
 
 class HintStatus(Enum):
-    # Inline hints are terminal at submit time: ACCEPTED or REJECTED only.
+    # Inline hints are terminal at submit time: ACCEPTED or REJECTED. A
+    # deferred hint is QUEUED, then exactly one of COMPLETED, FAILED, DROPPED.
     ACCEPTED = "ACCEPTED"  # inline work done
     REJECTED = "REJECTED"  # invalid, unsupported, handler_error
+    QUEUED = "QUEUED"  # deferred to poll_completed
+    COMPLETED = "COMPLETED"  # deferred work finished
+    FAILED = "FAILED"  # deferred work failed
+    DROPPED = "DROPPED"  # never admitted
 
 
 class HintResult(msgspec.Struct, frozen=True):
