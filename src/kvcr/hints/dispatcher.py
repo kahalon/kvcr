@@ -1,17 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Hint dispatch infrastructure.
-
-``HintDispatcher`` owns the hint type table and reports every hint's
-result; core holds one dispatcher and delegates to it. Each hint module
-defines a ``HintType`` (its parser and handler); ``_HINT_TYPES`` lists the
-supported ones.
-"""
+"""Hint routing, result reporting, and handler lifecycle hooks."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import msgspec
@@ -23,11 +17,9 @@ from .results import HintResult, HintStatus
 if TYPE_CHECKING:
     from ..core import _KVCRCore
 
-# The supported hint types. Every dispatcher builds one handler per entry.
 _HINT_TYPES: tuple[HintType, ...] = (KV_FETCH,)
 
 logger = logging.getLogger(__name__)
-# Handlers run on hot paths; warn once per (phase, action type) about errors.
 _LOGGED_HANDLER_ERRORS: set[str] = set()
 
 
@@ -46,10 +38,20 @@ def _warn_handler_error(action_type: str, phase: str) -> None:
 
 
 class _HintHandler(Protocol):
-    """Executes one action type.
+    """Own one hint type from submission through settlement.
 
-    ``submit`` runs on the caller's thread without the state lock, once per
-    hint, and must report exactly one result for it.
+    ``submit`` runs without the state lock: report inline or queue with QUEUED
+    before publication; raise only before either. Started hints get exactly
+    one COMPLETED/FAILED result, including per-item failures.
+
+    Optional ``poll_main(items)`` runs under the state lock after backends,
+    even for empty batches. Return unhandled items in order; own clocks,
+    expiry, capacity, and work budgets. Escaped errors propagate without replay.
+
+    Both cleanup hooks run under the state lock. Optional ``discard_pending``
+    drops queued work as DROPPED(closed) before quiescence, leaving shutdown
+    retryable. ``close`` runs after quiescence: reject deferrals, drop queued
+    work, and settle active hints as FAILED(closed).
     """
 
     action_type: str
@@ -65,13 +67,7 @@ class _HintHandler(Protocol):
 
 
 class HintDispatcher:
-    """Routes parsed hints to their handlers and reports their results.
-
-    Core owns one dispatcher and calls ``submit`` from the caller's thread and
-    ``close`` under its state lock once the progress loop is quiescent, with
-    the other main-thread resources. Which hint types exist is decided here,
-    by ``_HINT_TYPES``, not by core.
-    """
+    """Route hints and invoke handlers; handlers own queues and active work."""
 
     def __init__(self, core: _KVCRCore) -> None:
         self._core = core
@@ -80,16 +76,22 @@ class HintDispatcher:
             action_type: hint_type.handler_factory(core, self)
             for action_type, hint_type in self._types.items()
         }
+        self._polls: dict[str, Callable[[Collection[object]], list[object]]] = {}
+        self._discard_pending: dict[str, Callable[[], None]] = {}
+        for action_type, handler in self._handlers.items():
+            poll = getattr(handler, "poll_main", None)
+            if callable(poll):
+                self._polls[action_type] = poll
+            discard_pending = getattr(handler, "discard_pending", None)
+            if callable(discard_pending):
+                self._discard_pending[action_type] = discard_pending
         self._closed = False
-
-    # Caller thread, no state lock.
 
     def submit(
         self,
         envelope: Mapping[str, object] | msgspec.Struct,
         request_id: str | None,
     ) -> None:
-        """Parse an envelope, report its rejections, dispatch its hints."""
         self._core._progress.raise_if_failed()
         hints, rejected = parse_hints(envelope, self._types)
         for result in rejected:
@@ -106,10 +108,6 @@ class HintDispatcher:
         request_id: str | None,
         message_id: str | None,
     ) -> None:
-        # Contract: a handler reports the hint exactly once, or raises before
-        # doing so. Inline hints are terminal at submit time, so a raise
-        # means REJECTED, unless the raise is the fatal progress-thread
-        # failure, which propagates to the caller as it does without hints.
         try:
             handler.submit(hint, request_id, message_id)
         except Exception:
@@ -127,12 +125,7 @@ class HintDispatcher:
             )
 
     def report(self, result: HintResult) -> None:
-        """Record a hint's result; called by handlers and by the dispatcher.
-
-        Results are logged at debug level only; rejections and handler errors
-        already warn once per issue. No metric is emitted: integrations
-        forward KVCR stats and may reject names they do not declare.
-        """
+        """Log only; integrations may reject undeclared metrics."""
         logger.debug(
             "KV hint result; action_id=%s action_type=%s status=%s reason=%s",
             result.action_id,
@@ -141,10 +134,24 @@ class HintDispatcher:
             result.reason,
         )
 
-    # Main thread, under the state lock.
+    def poll_main(self, items: list[object]) -> list[object]:
+        for action_type, poll in self._polls.items():
+            try:
+                items = poll(items)
+            except Exception:
+                self._core._progress.raise_if_failed()
+                _warn_handler_error(action_type, "poll_main")
+                raise
+        return items
+
+    def discard_pending(self) -> None:
+        for action_type, discard_pending in self._discard_pending.items():
+            try:
+                discard_pending()
+            except Exception:
+                _warn_handler_error(action_type, "discard_pending")
 
     def close(self) -> None:
-        """Close handlers; idempotent."""
         if self._closed:
             return
         self._closed = True

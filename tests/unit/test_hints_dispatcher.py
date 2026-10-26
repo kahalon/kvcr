@@ -71,9 +71,6 @@ class _StubHandler:
         self.close_calls += 1
 
 
-_STUB_TYPE = HintType("kv.test", "1.0", lambda i, p: _StubHint(i), _StubHandler)
-
-
 def _envelope(*hints: tuple[str, str], message_id: str = "m1") -> _HintEnvelope:
     return _HintEnvelope(
         "0.1", message_id, [_HintAction(i, t, "1.0", {}) for i, t in hints]
@@ -84,12 +81,17 @@ def _tests(*ids: str) -> _HintEnvelope:
     return _envelope(*((i, "kv.test") for i in ids))
 
 
-def _stub_kvcr(monkeypatch, **config_fields):
+def _stub_kvcr(
+    monkeypatch, handler_factory=_StubHandler, *, extra_types=(), **config_fields
+):
     config = KVCRConfig(
         nixl_agent_name="target", pool_layouts=[("", 16)], **config_fields
     )
     # Handlers come from the hint type table, instantiated per core.
-    monkeypatch.setattr("kvcr.hints.dispatcher._HINT_TYPES", (*_HINT_TYPES, _STUB_TYPE))
+    stub_type = HintType("kv.test", "1.0", lambda i, p: _StubHint(i), handler_factory)
+    monkeypatch.setattr(
+        "kvcr.hints.dispatcher._HINT_TYPES", (*_HINT_TYPES, stub_type, *extra_types)
+    )
     kvcr = _new_kvcr(
         FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl(), config=config
     )
