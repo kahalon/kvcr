@@ -356,11 +356,7 @@ class _LocalDram:
             kvcr.config.abandon_timeout_ms - kvcr.config.operation_timeout_ms
         ) / 1000
         self._next_release_handle = 1
-        # A no-op until something attaches: the tiers publish residency
-        # changes unconditionally, and only recovery cares to hear them.
-        self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
-            lambda key, record: None
-        )
+        self._residency_observers: list[Callable[[BlockKey, "_BlockRecord"], None]] = []
 
     @property
     def memory_regions(self) -> tuple[RegionDescriptor, ...]:
@@ -372,7 +368,11 @@ class _LocalDram:
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
     ) -> None:
-        self._residency_observer = observer
+        self._residency_observers.append(observer)
+
+    def _residency_observer(self, key: BlockKey, record: "_BlockRecord") -> None:
+        for observer in self._residency_observers:
+            observer(key, record)
 
     def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
         """Take the rows already-recovered records name, before the core starts.
@@ -615,6 +615,7 @@ class _LocalDram:
         hints: object | None,
         layout: list[str],
         key_layout: tuple[str, ...] | None = None,
+        claim_on_ready: bool = True,
     ) -> dict[BlockKey, list[_TransferRef]]:
         ordered_keys = tuple(dict.fromkeys(keys))
         if not ordered_keys:
@@ -624,7 +625,7 @@ class _LocalDram:
             op_id=("fetch", op_handle),
             keys=frozenset(ordered_keys),
             deadline=deadline,
-            claim_on_ready=True,
+            claim_on_ready=claim_on_ready,
             request_id=request_id,
             requested_layout=layout,
             key_layout=key_layout,
@@ -652,7 +653,7 @@ class _LocalDram:
             op.results[key] = _FAILED_RESULT
             return None
         if residency is not None and residency.state is _LocalDramState.DISCARDING:
-            if source is not None:
+            if source is not None and op.claim_on_ready:
                 self._enqueue_capacity_waiter(op, key)
             else:
                 op.results[key] = _FAILED_RESULT
@@ -663,7 +664,7 @@ class _LocalDram:
                 return None
             reserved, waiting = self._reserve_fill(key, op, source)
             if not reserved:
-                if waiting:
+                if waiting and op.claim_on_ready:
                     self._enqueue_capacity_waiter(op, key)
                 else:
                     op.results[key] = _FAILED_RESULT
@@ -683,7 +684,11 @@ class _LocalDram:
         ):
             ready = [residency.slots[index] for index in indices]
             self._kvcr._record_access((key,))
-            op.results[key] = self._new_public_claim(key, residency, slots=ready)
+            op.results[key] = (
+                self._new_public_claim(key, residency, slots=ready)
+                if op.claim_on_ready
+                else _SUCCESS_RESULT
+            )
         else:
             if key not in op.claimed_keys:
                 self._acquire_claim(key, residency)
@@ -1062,6 +1067,7 @@ class _LocalDram:
                 {key: refs},
                 residency_op.request_id,
                 residency_op.deadline,
+                dram_only=not residency_op.claim_on_ready,
             )
         return key in residency_op.results
 
@@ -1077,7 +1083,7 @@ class _LocalDram:
         decision = self._kvcr._policy.decide_ingest(
             self._kvcr._block_meta(key, record, size_bytes),
             source,
-            required_local=True,
+            required_local=op.claim_on_ready,
             framework_hints=op.hints,
         )
         if decision[0] is PlacementAction.DROP:

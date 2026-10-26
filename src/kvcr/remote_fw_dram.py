@@ -14,7 +14,7 @@ Source: start_write -> local claim/framework pin -> write -> write_done.
 import logging
 import math
 import time
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -54,7 +54,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from .core import _KVCRCore
+    from .core import _BlockRecord, _KVCRCore
 
 
 _MEMORY_REF_LISTS_TYPE = tuple[tuple[_TransferRef, ...], ...]
@@ -112,6 +112,7 @@ class _TargetPullOp(_RemoteOp):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     request_id: str | None = None
     key_layout: tuple[str, ...] = ()
+    dram_only: bool = False
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
@@ -166,6 +167,7 @@ class _TargetPullOp(_RemoteOp):
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
                     **({"key_layout": self.key_layout} if self.local_fill else {}),
+                    **({"dram_only": True} if self.dram_only else {}),
                 },
             )
             if not sent:
@@ -288,6 +290,55 @@ class _TargetPullOp(_RemoteOp):
         return self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
 
 
+_ResolvedKeys = list[tuple[int, list[BlockKey], tuple[str, ...]]]
+
+
+@dataclass
+class _ResolveKeysOp(_RemoteOp):
+    """Target-side question to a peer: which of your keys store these hashes?
+
+    Sends ``resolve_keys`` and waits for the matching ``keys_resolved`` or its
+    deadline. Nothing native is involved, so it closes at once. The answer
+    reaches the owner on main through ``on_resolved``: the entries, or
+    ``None`` when the peer did not answer in time.
+    """
+
+    remote_ctrl_ep: str
+    block_hashes: tuple[int, ...]
+    on_resolved: Callable[[_ResolvedKeys | None], None] = field(
+        repr=False, compare=False
+    )
+    _backend: "_RemoteFWDram" = field(repr=False, compare=False)
+    sent: bool = False
+    resolved: _ResolvedKeys | None = None
+
+    def progress(
+        self, progress: _KVCRProgress, event: object | None
+    ) -> tuple[bool, bool]:
+        backend = self._backend
+        now = backend._kvcr._clock()
+        if now >= self.deadline:
+            return True, True
+        if not self.sent:
+            if not backend._send_control(
+                progress,
+                self.remote_ctrl_ep,
+                {
+                    "type": "resolve_keys",
+                    "op_handle": self.op_id[1],
+                    "block_hashes": list(self.block_hashes),
+                    "remaining_timeout_ms": (self.deadline - now) * 1000,
+                },
+            ):
+                return True, True
+            self.sent = True
+            return False, True
+        if isinstance(event, Mapping) and event.get("type") == "keys_resolved":
+            self.resolved = cast(_ResolvedKeys, event["resolved"])
+            return True, True
+        return False, False
+
+
 @dataclass(slots=True)
 class _NvtxState:
     requested_blocks: int = -1
@@ -310,6 +361,7 @@ class _SourcePinOp(_Op):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
     key_layout: tuple[str, ...] = ()
+    dram_only: bool = False
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -608,6 +660,9 @@ class _RemoteFWDram:
         # Main-thread state: request hints, framework pins, and progress state.
         self._closed = False
         self._request_hints: dict[str, _RequestHint] = {}
+        # Immutable values permit advisory progress-thread reads. Pulls revalidate.
+        self._hash_index: dict[int, list[tuple[BlockKey, tuple[str, ...]]]] = {}
+        self._hash_index_disabled = key_adapter is None
         self._connected_remote_count = 0
         self._source_pin_ops: dict[_OpId, _SourcePinOp] = {}
         self._pending_pin_ops: dict[PinRequestId, _PendingPinWait] = {}
@@ -629,6 +684,7 @@ class _RemoteFWDram:
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
         self._refused_writes: dict[_OpId, dict[str, Any]] = {}
+        self._resolve_replies: dict[_OpId, dict[str, Any]] = {}
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
@@ -688,6 +744,7 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
+        dram_only: bool = False,
     ) -> bool:
         kvcr = self._kvcr
         started_at = kvcr._timer()
@@ -712,6 +769,7 @@ class _RemoteFWDram:
         op = _TargetPullOp(
             state=_TargetPullState.START_WRITE,
             local_fill=local_fill,
+            dram_only=dram_only,
             keys=frozenset(blocks),
             started_at=started_at,
             deadline=deadline,
@@ -743,6 +801,34 @@ class _RemoteFWDram:
         if not local_fill and request_id is not None:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
         return True
+
+    def resolve_keys(
+        self,
+        source: str,
+        block_hashes: Collection[int],
+        deadline: float,
+        *,
+        op_handle: OpHandle,
+        on_resolved: Callable[[_ResolvedKeys | None], None],
+    ) -> None:
+        """Ask ``source`` which of its keys store ``block_hashes``.
+
+        ``on_resolved`` runs on the main thread with the source's
+        ``(hash, keys, layout)`` entries in request order, or ``None`` when
+        the peer did not answer before ``deadline``.
+        """
+        self._kvcr._progress.submit(
+            _ResolveKeysOp(
+                op_id=("resolve", op_handle),
+                keys=frozenset(),
+                started_at=self._kvcr._timer(),
+                deadline=deadline,
+                remote_ctrl_ep=source,
+                block_hashes=tuple(block_hashes),
+                on_resolved=on_resolved,
+                _backend=self,
+            )
+        )
 
     def deliver(
         self,
@@ -776,6 +862,7 @@ class _RemoteFWDram:
         deadline: float,
         *,
         op_handle: OpHandle,
+        dram_only: bool = False,
     ) -> bool:
         return self._start_target_pull(
             blocks,
@@ -783,6 +870,7 @@ class _RemoteFWDram:
             deadline,
             op_handle,
             local_fill=True,
+            dram_only=dram_only,
         )
 
     def poll_main(self, items: Collection[object]) -> list[object]:
@@ -833,6 +921,8 @@ class _RemoteFWDram:
                         f"KVCR target operation {item.op_id!r} returned to main "
                         f"in state {item.state.name}"
                     )
+            elif isinstance(item, _ResolveKeysOp):
+                item.on_resolved(item.resolved)
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
             else:
@@ -850,6 +940,61 @@ class _RemoteFWDram:
 
     def discard_hint(self, request_id: str) -> None:
         self._request_hints.pop(request_id, None)
+
+    def observe_local_residency(self, key: BlockKey, record: "_BlockRecord") -> None:
+        """Keep the hash index in step with a key's local DRAM residency.
+
+        Called by local DRAM on every residency change, under the state lock.
+        A READY, fully committed residency is indexed; anything else removes
+        the key. Values are replaced, never mutated, for the lock-free reader.
+        """
+        if self._hash_index_disabled:
+            return
+        try:
+            block_hash = self._key_adapter.decode(key)  # type: ignore[union-attr]
+        except Exception:
+            logger.warning("KVCR hash index skipped a key the adapter cannot decode")
+            return
+        if type(block_hash) is not int:
+            # Router hashes are 64-bit ints; a bytes-decoding adapter cannot
+            # match them, so prefetch cannot source blocks from this node.
+            self._hash_index_disabled = True
+            self._hash_index.clear()
+            logger.warning(
+                "KVCR hash index disabled: the key adapter decodes to %s, not int, "
+                "so CPU-destination kv.fetch cannot resolve this node's blocks",
+                type(block_hash).__name__,
+            )
+            return
+        if not 0 <= block_hash < 1 << 64:
+            return
+        residency = record.local_dram
+        entries = self._hash_index.get(block_hash)
+        if (
+            residency is not None
+            and residency.state is _LocalDramState.READY
+            and not residency.pending_labels
+            and tuple(residency.layout) == residency.key_layout
+        ):
+            layout = residency.key_layout or ()
+            if entries is None:
+                self._hash_index[block_hash] = [(key, layout)]
+            else:
+                self._hash_index[block_hash] = [
+                    entry for entry in entries if entry[0] != key
+                ] + [(key, layout)]
+        elif entries is not None:
+            remaining = [entry for entry in entries if entry[0] != key]
+            if remaining:
+                self._hash_index[block_hash] = remaining
+            else:
+                del self._hash_index[block_hash]
+
+    def seed_hash_index(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
+        """Index recovered residencies, which arrive without observer events."""
+        for key, record in records.items():
+            if record.local_dram is not None:
+                self.observe_local_residency(key, record)
 
     def _fail_request_hint(self, request_id: str | None) -> None:
         if request_id is None:
@@ -977,6 +1122,8 @@ class _RemoteFWDram:
             ):
                 events[op_id] = refusal
         self._refused_writes.clear()
+        events.update(self._resolve_replies)
+        self._resolve_replies.clear()
         observed_work |= bool(events)
         return events, observed_work
 
@@ -1036,6 +1183,10 @@ class _RemoteFWDram:
                 self._dangling_ops.handle_probe(progress, payload)
             elif message_type == "write_probe_ack":
                 self._dangling_ops.handle_probe_ack(progress, payload)
+            elif message_type == "resolve_keys":
+                self._handle_resolve_keys(progress, payload)
+            elif message_type == "keys_resolved":
+                self._handle_keys_resolved(progress, payload)
             elif message_type == "start_write":
                 self._handle_start_write(progress, payload)
             else:
@@ -1066,7 +1217,8 @@ class _RemoteFWDram:
         if message_type != "target_metadata_ack":
             payload["source_control_endpoint"] = endpoint
         includes_metadata = (
-            message_type not in ("target_metadata_ack", "write_refused")
+            message_type
+            not in ("target_metadata_ack", "write_refused", "keys_resolved")
             and endpoint not in self._metadata_acked_sources
             and (
                 message_type in ("target_metadata", "start_write")
@@ -1200,6 +1352,108 @@ class _RemoteFWDram:
     # to main; progress writes to the target.
     # -------------------------------------------------------------------------
 
+    def _handle_keys_resolved(
+        self, progress: _KVCRProgress, payload: dict[str, Any]
+    ) -> None:
+        """Route a source's answer to the resolve operation that asked.
+
+        An answer must belong to this peer and operation. Reject malformed
+        answers as a whole, before any layout group can start a transfer.
+        """
+        op_handle = payload.get("op_handle")
+        endpoint = payload.get("sender_control_endpoint")
+        if type(op_handle) is not int or not isinstance(endpoint, str):
+            return
+        op = progress._in_flight_ops.get(("resolve", op_handle))
+        if not isinstance(op, _ResolveKeysOp) or op.remote_ctrl_ep != endpoint:
+            return
+        entries = payload.get("resolved")
+        resolved: _ResolvedKeys | None = []
+        seen: set[BlockKey] = set()
+        requested = set(op.block_hashes)
+        try:
+            if not isinstance(entries, list):
+                raise ValueError("invalid resolved entries")
+            for entry in entries:
+                if not isinstance(entry, list) or len(entry) != 3:
+                    raise ValueError("invalid resolved entry")
+                block_hash, keys, layout = entry
+                if (
+                    type(block_hash) is not int
+                    or block_hash not in requested
+                    or not isinstance(keys, list)
+                    or not keys
+                    or not all(isinstance(key, bytes) and key for key in keys)
+                    or not isinstance(layout, list)
+                ):
+                    raise ValueError("invalid resolved key or hash")
+                declaration = self._kvcr._validate_expected_layout(layout)
+                for key in keys:
+                    if key in seen:
+                        raise ValueError("duplicate resolved key")
+                    if (
+                        self._key_adapter is None
+                        or self._key_adapter.decode(key) != block_hash
+                    ):
+                        raise ValueError("resolved key does not match its hash")
+                    seen.add(key)
+                resolved.append(
+                    (block_hash, [BlockKey(key) for key in keys], declaration)
+                )
+        except Exception:
+            resolved = None
+        self._resolve_replies[op.op_id] = {
+            "type": "keys_resolved",
+            "resolved": resolved,
+        }
+
+    def _handle_resolve_keys(
+        self, progress: _KVCRProgress, payload: dict[str, Any]
+    ) -> None:
+        """Answer a peer's prefetch question: which keys store these hashes?
+
+        Runs on the progress thread without the state lock; see the index's
+        note. Malformed hashes resolve to nothing but still get a reply, so the
+        asker does not wait out its deadline.
+        """
+        op_handle = payload.get("op_handle")
+        if type(op_handle) is not int:
+            logger.warning("KVCR malformed resolve_keys: invalid op_handle")
+            return
+        reply_to = payload.get("sender_control_endpoint")
+        reflected_self = payload.get("source_control_endpoint")
+        if not isinstance(reply_to, str) or not isinstance(reflected_self, str):
+            return
+        hashes = payload.get("block_hashes")
+        resolved: list[list[Any]] = []
+        if isinstance(hashes, list) and all(
+            type(h) is int and 0 <= h < 1 << 64 for h in hashes
+        ):
+            index = self._hash_index
+            for block_hash in hashes:
+                entries = index.get(block_hash)
+                if not entries:
+                    continue
+                by_layout: dict[tuple[str, ...], list[BlockKey]] = {}
+                for key, layout in entries:
+                    by_layout.setdefault(layout, []).append(key)
+                for layout, keys in by_layout.items():
+                    resolved.append([block_hash, keys, list(layout)])
+        else:
+            logger.warning(
+                "KVCR malformed resolve_keys op=%d: invalid hashes", op_handle
+            )
+        self._send_control(
+            progress,
+            reply_to,
+            {
+                "type": "keys_resolved",
+                "sender_control_endpoint": reflected_self,
+                "op_handle": op_handle,
+                "resolved": resolved,
+            },
+        )
+
     def _handle_start_write(
         self, progress: _KVCRProgress, payload: dict[str, Any]
     ) -> None:
@@ -1219,6 +1473,9 @@ class _RemoteFWDram:
             ):
                 raise TypeError("invalid remaining_timeout_ms")
             keys = _message_keys(payload)
+            dram_only = payload.get("dram_only", False)
+            if type(dram_only) is not bool:
+                raise ValueError("invalid dram_only")
             key_layout = msgspec.convert(
                 payload.get("key_layout", ()), type=tuple[str, ...]
             )
@@ -1313,6 +1570,7 @@ class _RemoteFWDram:
             ordered_keys=keys,
             dst_descriptors=dst_descriptors,
             key_layout=key_layout,
+            dram_only=dram_only,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
             nvtx_state=_NvtxState(
                 requested_blocks=len(keys),
@@ -1348,6 +1606,8 @@ class _RemoteFWDram:
                 record = kvcr._block_record_map.get(key)
                 residency = record.local_dram if record is not None else None
                 if residency is None or residency.state is not _LocalDramState.READY:
+                    return False
+                if source_pin.dram_only and residency.pending_labels:
                     return False
                 if (
                     source_pin.key_layout
@@ -1418,7 +1678,8 @@ class _RemoteFWDram:
         framework_sources = {
             key: record.fw_mem.descriptors
             for key in source_pin.keys
-            if key not in local_sources
+            if not source_pin.dram_only
+            and key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
@@ -1429,6 +1690,8 @@ class _RemoteFWDram:
             if key not in source_pin.keys:
                 continue
             residency = local_sources.get(key)
+            if source_pin.dram_only and (residency is None or residency.pending_labels):
+                continue
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
@@ -1696,6 +1959,10 @@ class _RemoteFWDram:
             self._submit_prepared_source_write(
                 op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
             )
+            return
+
+        if op.dram_only:
+            self._submit_prepared_source_write(op_id, op)
             return
 
         local_sources = kvcr._claim_local_dram_sources(

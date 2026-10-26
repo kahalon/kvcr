@@ -1599,3 +1599,164 @@ def test_start_write_refusal_names_why(incarnation, with_metadata, stopping, rea
     )
     assert not agent.sent_notifs
     assert bool(tier._dangling_ops.source_writes) is (reason is None and not stopping)
+
+
+class _PrefixHashAdapter:
+    """Router hash is the first 8 bytes of the key, as vLLM's int mode is."""
+
+    def decode(self, key):
+        return int.from_bytes(key[:8], "big")
+
+
+class _BytesHashAdapter:
+    def decode(self, key):
+        return bytes(key[:8])
+
+
+def _hash_key(block_hash: int, group: int = 0) -> BlockKey:
+    return BlockKey(block_hash.to_bytes(8, "big") + group.to_bytes(4, "big"))
+
+
+def _index_source(slot_count: int = 3, key_adapter=_PrefixHashAdapter(), **kwargs):
+    memory = ctypes.create_string_buffer(16 * slot_count)
+    agent, control = FakeNixlAgent(), FakeBytesControl("tcp://source:1")
+    source = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        name="source",
+        key_adapter=key_adapter,
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        **kwargs,
+    )
+    agent.state = "DONE"
+    return source, agent, control, memory
+
+
+def _deposit_ready(source, key: BlockKey) -> None:
+    deposit = source.deposit({key: [_mem_descriptor(end_point_name="source")]})
+    assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+
+
+def _index(source) -> dict:
+    return source._core._remote_fw_dram._hash_index
+
+
+def test_hash_index_tracks_ready_local_dram_residencies():
+    source, _, _, _ = _index_source()
+    now = [100.0]
+    source._core._clock = lambda: now[0]
+    k70, k71, k9, k11 = _hash_key(7, 0), _hash_key(7, 1), _hash_key(9), _hash_key(11)
+    for key in (k70, k71, k9):
+        _deposit_ready(source, key)
+        now[0] += 1
+    # One router hash may own several keys (one per KV group), in insertion order.
+    assert _index(source) == {
+        7: [(k70, ("",)), (k71, ("",))],
+        9: [(k9, ("",))],
+    }
+    # The pool is full: the next deposit evicts the least recently used block.
+    _deposit_ready(source, k11)
+    assert _index(source) == {7: [(k71, ("",))], 9: [(k9, ("",))], 11: [(k11, ("",))]}
+    # A retired residency leaves the index too.
+    source._core._block_record_map[k9].local_dram.retire_on_release = True
+    source.align_sequence([k9])  # repositioning republishes a READY residency
+    assert 9 in _index(source)
+    handle = source.fetch([k9])
+    results = dict(_poll_until(source, bool))
+    release = next(iter(results[handle].values())).release_handle
+    source.release([release])
+    assert 9 not in _index(source)
+
+
+def test_hash_index_is_seeded_from_recovered_records():
+    source, _, _, _ = _index_source()
+    key = _hash_key(42)
+    install_recovery_records(
+        source._core,
+        {
+            key: _BlockRecord(
+                local_dram=_LocalDramResidency([("", 0)], _LocalDramState.READY)
+            )
+        },
+    )
+    assert _index(source) == {42: [(key, ("",))]}
+
+
+def test_hash_index_stays_empty_for_bytes_hashes(caplog):
+    source, _, _, _ = _index_source(key_adapter=_BytesHashAdapter())
+    with caplog.at_level(logging.WARNING, logger="kvcr"):
+        _deposit_ready(source, _hash_key(1))
+        _deposit_ready(source, _hash_key(2))
+    assert _index(source) == {}
+    warnings = [r for r in caplog.records if "hash index" in r.getMessage()]
+    assert len(warnings) == 1  # disabled once, silent afterwards
+
+
+def _resolve_request(op_handle, hashes) -> bytes:
+    return msgspec.msgpack.encode(
+        {
+            "type": "resolve_keys",
+            "op_handle": op_handle,
+            "block_hashes": hashes,
+            "remaining_timeout_ms": 1000,
+            "sender_control_endpoint": "tcp://target:1",
+            "source_control_endpoint": "tcp://source:1",
+        }
+    )
+
+
+def _reply(control) -> dict:
+    _wait_until(lambda: bool(control.sent))
+    endpoint, message = control.sent.pop()
+    assert endpoint == "tcp://target:1"
+    return _decode_control_message(message)
+
+
+def test_resolve_keys_replies_with_the_keys_and_layout_of_known_hashes():
+    source, _, control, _ = _index_source()
+    k70, k71, k9 = _hash_key(7, 0), _hash_key(7, 1), _hash_key(9)
+    for key in (k70, k71, k9):
+        _deposit_ready(source, key)
+    control.incoming.append(_resolve_request(5, [9, 7, 99]))
+    reply = _reply(control)
+    assert reply["type"] == "keys_resolved"
+    assert reply["op_handle"] == 5
+    assert reply["sender_control_endpoint"] == "tcp://source:1"
+    # Request order is kept; unknown hashes are simply absent.
+    assert reply["resolved"] == [[9, [k9], [""]], [7, [k70, k71], [""]]]
+    assert "target_agent_metadata" not in reply
+
+
+@pytest.mark.parametrize(
+    "hashes", ["bad", [True], [1.5], None], ids=["str", "bool", "float", "none"]
+)
+def test_resolve_keys_malformed_hashes_still_get_an_empty_reply(hashes):
+    source, _, control, _ = _index_source()
+    _deposit_ready(source, _hash_key(1))
+    control.incoming.append(_resolve_request(6, hashes))
+    reply = _reply(control)
+    assert (reply["type"], reply["op_handle"], reply["resolved"]) == (
+        "keys_resolved",
+        6,
+        [],
+    )
+
+
+def test_resolve_keys_without_an_adapter_or_a_match_replies_empty():
+    source, _, control, _ = _index_source(key_adapter=None)
+    _deposit_ready(source, _hash_key(1))
+    control.incoming.append(_resolve_request(7, [1]))
+    assert _reply(control)["resolved"] == []
+
+
+def test_resolve_keys_without_an_op_handle_is_ignored():
+    source, _, control, _ = _index_source()
+    request = msgspec.msgpack.decode(_resolve_request(8, [1]))
+    del request["op_handle"]
+    control.incoming.append(msgspec.msgpack.encode(request))
+    control.incoming.append(_resolve_request(9, [1]))
+    assert _reply(control)["op_handle"] == 9
+    assert control.sent == []
