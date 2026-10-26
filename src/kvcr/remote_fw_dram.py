@@ -785,8 +785,9 @@ class _RemoteFWDram:
             local_fill=True,
         )
 
-    def poll_main(self, items: Collection[object]) -> None:
+    def poll_main(self, items: Collection[object]) -> list[object]:
         self._release_framework_pins(tuple(self._releasing_framework_pins))
+        unhandled: list[object] = []
         for item in items:
             if isinstance(item, _SourcePinOp):
                 self._start_source_pin(item)
@@ -835,7 +836,7 @@ class _RemoteFWDram:
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
             else:
-                raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
+                unhandled.append(item)
         if not self._closed:
             self._process_pending_pin_results()
             now = self._kvcr._clock()
@@ -845,6 +846,7 @@ class _RemoteFWDram:
                     self._expire_source_pin(op_id, op)
                 elif not op.pending_pin_ids:
                     self._resume_source_pin(op_id, op)
+        return unhandled
 
     def discard_hint(self, request_id: str) -> None:
         self._request_hints.pop(request_id, None)
