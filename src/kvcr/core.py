@@ -259,6 +259,12 @@ class _KVCRCore:
         ] = {}
 
         self._completion_queue: list[OpResult] = []
+        self._completion_owners: dict[
+            OpHandle,
+            tuple[
+                tuple[BlockKey, ...], Callable[[Mapping[BlockKey, OpEntryResult]], None]
+            ],
+        ] = {}
         self._resilience_errors: deque[Exception] = deque()
         self._pending_progress_items: list[object] = []
         self._joined_completions: dict[
@@ -316,6 +322,10 @@ class _KVCRCore:
             backend_configs.remote_fw_dram,
             bindings.key_adapter,
         )
+        if self._local_dram is not None:
+            self._local_dram.observe_residency(
+                self._remote_fw_dram.observe_local_residency
+            )
         self._g3 = (
             _G3(
                 self,
@@ -404,6 +414,7 @@ class _KVCRCore:
         self._block_record_map = records
 
         local_dram.adopt_recovery_slots(records)
+        self._remote_fw_dram.seed_hash_index(records)
         if g3 is not None:
             g3.adopt_recovery_slots(records)
 
@@ -672,6 +683,9 @@ class _KVCRCore:
         request_id: str | None = None,
         expected_layout: list[str] | None = None,
         hints: object | None = None,
+        *,
+        on_complete: Callable[[Mapping[BlockKey, OpEntryResult]], None] | None = None,
+        claim_on_ready: bool = True,
     ) -> OpHandle:
         declaration = self._validate_expected_layout(
             [""] if expected_layout is None else expected_layout
@@ -682,6 +696,9 @@ class _KVCRCore:
         local_dram = self._local_dram
         ordered_keys = tuple(dict.fromkeys(keys))
         with self._state_lock:
+            # Local hits, policy rejection and empty requests can finish inline.
+            if on_complete is not None:
+                self._completion_owners[op_handle] = (ordered_keys, on_complete)
             if local_dram is None:
                 self._complete(
                     op_handle,
@@ -714,6 +731,7 @@ class _KVCRCore:
                 hints=hints,
                 layout=requested,
                 key_layout=declaration,
+                claim_on_ready=claim_on_ready,
             )
             for source in (CacheTier.G3, CacheTier.REMOTE_G2):
                 self._start_local_fill(
@@ -725,6 +743,7 @@ class _KVCRCore:
                     },
                     request_id,
                     deadline,
+                    dram_only=not claim_on_ready,
                 )
         return op_handle
 
@@ -842,6 +861,8 @@ class _KVCRCore:
     def _close_hint_handlers(self) -> None:
         with self._state_lock:
             self._hints_dispatcher.close()
+            for handle, (keys, _) in list(self._completion_owners.items()):
+                self._complete(handle, dict.fromkeys(keys, _FAILED_RESULT))
 
     def _close_main_resources(self) -> None:
         self._remote_delivery_keys.clear()
@@ -1015,6 +1036,8 @@ class _KVCRCore:
         blocks: Mapping[BlockKey, list[_TransferRef]],
         request_id: str | None,
         deadline: float,
+        *,
+        dram_only: bool = False,
     ) -> None:
         if not blocks:
             return
@@ -1028,7 +1051,11 @@ class _KVCRCore:
             )
         elif source is CacheTier.REMOTE_G2:
             started = self._remote_fw_dram.fetch(
-                blocks, request_id, deadline, op_handle=fill_handle
+                blocks,
+                request_id,
+                deadline,
+                op_handle=fill_handle,
+                dram_only=dram_only,
             )
         else:
             raise ValueError(f"unsupported local fill source {source.value}")
@@ -1263,7 +1290,11 @@ class _KVCRCore:
                 return
             self._joined_completions.pop(op_handle)
             entries = completed
-        self._completion_queue.append((op_handle, entries))
+        owner = self._completion_owners.pop(op_handle, None)
+        if owner is not None:
+            owner[1](entries)
+        else:
+            self._completion_queue.append((op_handle, entries))
 
     # Timing and telemetry helpers.
 
