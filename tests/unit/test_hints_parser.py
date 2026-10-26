@@ -63,6 +63,24 @@ def test_parse_hints_accepts_struct_and_mapping(as_mapping):
     assert hints[0].block_hashes == frozenset({123, 456})
 
 
+@pytest.mark.parametrize("destination", ["CPU", {}, {"medium": "DISK"}, {"medium": []}])
+def test_invalid_destination_is_rejected_without_losing_other_actions(destination):
+    envelope = _HintEnvelope(
+        "0.1",
+        "m",
+        [
+            _fetch_hint("bad", "tcp://source:1", [1], destination=destination),
+            _fetch_hint("good", "tcp://source:1", [2], destination={"medium": "CPU"}),
+        ],
+    )
+    hints, rejected = parse_hints(envelope, _types())
+    assert [hint.action_id for hint in hints] == ["good"]
+    assert hints[0].destination == "CPU"
+    assert [(result.action_id, result.status) for result in rejected] == [
+        ("bad", HintStatus.REJECTED)
+    ]
+
+
 def test_parse_hints_non_mapping_action_and_payload():
     hint = _HintEnvelope(
         "0.1",

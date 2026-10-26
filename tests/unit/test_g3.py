@@ -5,6 +5,7 @@ import ctypes
 import logging
 import os
 
+import msgspec
 import pytest
 from _kvcr_test_utils import (
     _OPEN_KVCRS,
@@ -19,6 +20,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _record_hint_results,
     _recovered_record,
     _router_hint,
     _write_done_notification,
@@ -37,6 +39,7 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
+from kvcr.hints.results import HintStatus
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
@@ -210,6 +213,70 @@ def _metric_totals(stats):
         key = (kind, name, *labels)
         totals[key] = totals.get(key, 0) + value
     return totals
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="G3 requires Linux O_DIRECT")
+@pytest.mark.parametrize("capacity_pending", [False, True])
+def test_cpu_hint_promotes_disk_residency_or_fails_without_capacity_wait(
+    tmp_path, monkeypatch, capacity_pending
+):
+    from test_hints_prefetch import _envelope, _HashKeyAdapter, _key, _prefetch
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size)
+    primary = ctypes.create_string_buffer(page_size)
+    agent, control, events = _FakeG3Agent(), FakeBytesControl(), []
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        control=control,
+        key_adapter=_HashKeyAdapter(),
+        inventory_sink=events.append,
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        framework_regions=[_buffer_region(primary, page_size)],
+    )
+    key = _key(1)
+    install_recovery_records(kvcr._core, {key: _BlockRecord(g3=_G3Residency(0))})
+    descriptor = kvcr._core._g3._descriptor(0)
+    agent._file_data[(descriptor.device_Id, descriptor.addr)] = b"a" * page_size
+    if capacity_pending:
+        assert _deposit(kvcr, _key(9), 0).success
+        agent.state = "PROC"  # the eviction spill cannot free capacity yet
+    events.clear()
+    results = _record_hint_results(monkeypatch, kvcr)
+    kvcr.submit_hint(_envelope(_prefetch("cpu", [1])))
+    assert _poll_until(kvcr, lambda _: bool(control.sent)) == []
+    question = _decode_control_message(control.sent[0][1])
+    control.incoming.append(
+        msgspec.msgpack.encode(
+            {
+                "type": "keys_resolved",
+                "sender_control_endpoint": "tcp://source:1",
+                "op_handle": question["op_handle"],
+                "resolved": [[1, [key], [""]]],
+            }
+        )
+    )
+    assert _poll_until(kvcr, lambda _: len(results) == 2) == []
+    assert results[-1].status is (
+        HintStatus.FAILED if capacity_pending else HintStatus.COMPLETED
+    )
+    assert not kvcr._core._local_dram._capacity_waiters
+    assert not kvcr._core._local_dram._public_claims
+    assert not kvcr._core._completion_owners
+    assert not any(
+        _decode_control_message(raw)["type"] == "start_write" for _, raw in control.sent
+    )
+    if capacity_pending:
+        assert kvcr.query([key]) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
+        agent.state = "DONE"
+        _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
+        assert results[-1].status is HintStatus.FAILED
+    else:
+        assert local.raw == b"a" * page_size
+        assert kvcr.query([key]) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+        assert InventoryEvent((key,), CacheTier.LOCAL_G2, False) in events
 
 
 @pytest.mark.parametrize(

@@ -94,12 +94,16 @@ class _CountingLock:
         return self._inner.release()
 
 
-def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch):
+@pytest.mark.parametrize("destination", [None, {"medium": "GPU"}])
+def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch, destination):
     kvcr, results = _fetch_kvcr(monkeypatch)
     lock = _CountingLock(kvcr._core._state_lock)
     kvcr._core._state_lock = lock
 
-    kvcr.submit_hint(_router_hint("tcp://a:1", (1,)), "req")
+    envelope = _router_hint("tcp://a:1", (1,))
+    if destination is not None:
+        envelope.actions[0].payload["destination"] = destination
+    kvcr.submit_hint(envelope, "req")
 
     assert lock.entries == 0
     assert kvcr.query((_key(1),), "req") == [_FETCHABLE]
