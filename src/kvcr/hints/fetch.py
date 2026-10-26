@@ -1,6 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Engine-directed fetch hints and autonomous CPU-destination fills."""
+"""Engine-directed fetch hints and autonomous CPU-destination fills.
+
+A ``kv.fetch`` with a missing or GPU destination stores a source for later
+engine ``fetch`` or ``deliver`` calls. With ``destination={"medium": "CPU"}``,
+it enters this handler's deferred queue and autonomously fills KVCR-owned
+DRAM as the integration continues calling ``poll_completed``. Fetch hints
+require a source control endpoint, ``mode=copy``, and no ``no_retain`` field.
+Discarding the carrier request's hint does not cancel a CPU prefetch.
+
+CPU prefetch resolves router hashes to complete, committed keys and their
+layouts at the source. Several cache-group keys may share one hash. Both
+peers must support the resolution protocol and its DRAM-only source
+restriction: an eviction between resolution and transfer fails the affected
+key, without framework-memory fallback. The destination reuses normal fetch
+reservations, compatible in-flight fills, missing-piece completion, and
+local-disk promotion. Policy admission is optional, unavailable capacity
+fails immediately, and successful copies carry no public claim and remain
+ordinarily evictable. Resolution uses ``operation_timeout_ms``; fetch then
+receives its normal operation timeout and native abandonment grace.
+
+Successful complete blocks publish normal ``LOCAL_G2`` inventory events and
+clear remembered remote selections across requests. The next lookup and
+delivery can use local DRAM while that copy remains resident; transfers
+already started retain their original route. Router visibility remains
+eventual. An admitted CPU hint reports ``COMPLETED`` for full fulfillment,
+``COMPLETED`` with reason ``partial`` when some useful keys succeed, and
+``FAILED`` when none succeed. Internal fetch completions do not enter the
+engine's completion queue. Closing KVCR settles outstanding hints once.
+"""
 
 from __future__ import annotations
 
